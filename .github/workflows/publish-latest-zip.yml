@@ -110,16 +110,13 @@ jobs:
           echo "================================================================================" >> plugin-full.txt
           echo "" >> plugin-full.txt
 
-          # Include all plugin files except plugin-update-checker library
-          find . -type f \
+          # Include only text-based plugin files (exclude binaries and generated files)
+          find . -type f \( -name "*.php" -o -name "*.txt" -o -name "*.md" -o -name "*.po" \) \
             -not -path "./.git/*" \
             -not -path "./.github/*" \
             -not -path "./build/*" \
             -not -path "./plugin-update-checker/*" \
-            -not -name ".DS_Store" \
             -not -name "plugin-full.txt" \
-            -not -name ".htaccess" \
-            -not -name "latest.json" \
             | sort | while read file; do
               echo "==== FILE: ${file#./} ====" >> plugin-full.txt
               cat "$file" >> plugin-full.txt
