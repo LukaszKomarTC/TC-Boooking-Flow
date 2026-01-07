@@ -34,12 +34,27 @@ jobs:
           echo "Contents of build directory:"
           ls -la "$BUILD_DIR/$PLUGIN_SLUG/"
 
+          echo "Verifying main plugin file was copied:"
+          ls -lh "$BUILD_DIR/$PLUGIN_SLUG/tc-booking-flow.php"
+          head -5 "$BUILD_DIR/$PLUGIN_SLUG/tc-booking-flow.php"
+
+          echo "File count in build directory:"
+          find "$BUILD_DIR/$PLUGIN_SLUG" -type f | wc -l
+
           cd "$BUILD_DIR"
           zip -r "../latest.zip" "$PLUGIN_SLUG"
 
           echo "Zip file created:"
           ls -lh ../latest.zip
-          unzip -l ../latest.zip | head -20
+
+          echo "Zip contents (first 30 entries):"
+          unzip -l ../latest.zip | head -30
+
+          echo "Verifying zip integrity:"
+          unzip -t ../latest.zip
+
+          echo "Checking main plugin file in zip:"
+          unzip -p ../latest.zip "$PLUGIN_SLUG/tc-booking-flow.php" | head -10
 
       - name: Create latest.json
         env:
