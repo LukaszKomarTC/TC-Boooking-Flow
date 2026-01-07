@@ -82,27 +82,23 @@ jobs:
           SFTP_USER="$(printf "%s" "$SFTP_USER_RAW" | tr -d '\r' | xargs)"
           REMOTE_DIR="$(printf "%s" "$REMOTE_DIR_RAW" | tr -d '\r' | xargs)"
 
-          # Create directories recursively if needed
+          # Create directories recursively by navigating step-by-step
           IFS='/' read -ra DIRS <<< "$REMOTE_DIR"
-          CURRENT_PATH=""
 
           cat > sftp-batch.txt <<EOF
           EOF
 
-          # Build mkdir commands for each directory level
+          # Build mkdir and cd commands for each directory level
           for DIR in "${DIRS[@]}"; do
             if [ -n "$DIR" ]; then
-              if [ -z "$CURRENT_PATH" ]; then
-                CURRENT_PATH="$DIR"
-              else
-                CURRENT_PATH="$CURRENT_PATH/$DIR"
-              fi
-              echo "-mkdir \"$CURRENT_PATH\"" >> sftp-batch.txt
+              cat >> sftp-batch.txt <<EOF
+          -mkdir "$DIR"
+          cd "$DIR"
+          EOF
             fi
           done
 
           cat >> sftp-batch.txt <<EOF
-          cd "$REMOTE_DIR"
           put latest.zip
           put latest.json
           bye
