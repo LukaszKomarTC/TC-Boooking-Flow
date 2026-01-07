@@ -69,26 +69,20 @@ jobs:
           echo "Creating latest.json with version $VERSION"
 
           # Create JSON with WordPress plugin update checker format
-          cat > latest.json <<'EOF'
+          cat > latest.json << JSONEOF
 {
-  "name": "TC — Booking Flow (GF → Cart → Order) + Early Booking Snapshot",
-  "version": "VERSION_PLACEHOLDER",
-  "download_url": "DOWNLOAD_URL_PLACEHOLDER",
+  "name": "TC - Booking Flow (GF to Cart to Order) + Early Booking Snapshot",
+  "version": "$VERSION",
+  "download_url": "$DOWNLOAD_URL",
   "requires": "5.0",
   "tested": "6.4",
-  "last_updated": "DATE_PLACEHOLDER",
+  "last_updated": "$DATE",
   "sections": {
-    "description": "Consolidates GF44 → Woo cart/order booking flow and Early Booking Discount snapshot. Supports optional split of participation vs rental and per-event EB scope toggles.",
-    "changelog": "<h4>VERSION_PLACEHOLDER</h4><ul><li>Build commit: COMMIT_PLACEHOLDER</li><li>Build date: DATE_PLACEHOLDER</li></ul>"
+    "description": "Consolidates GF44 to Woo cart/order booking flow and Early Booking Discount snapshot. Supports optional split of participation vs rental and per-event EB scope toggles.",
+    "changelog": "<h4>$VERSION</h4><ul><li>Build commit: $COMMIT</li><li>Build date: $DATE</li></ul>"
   }
 }
-EOF
-
-          # Replace placeholders
-          sed -i "s/VERSION_PLACEHOLDER/$VERSION/g" latest.json
-          sed -i "s|DOWNLOAD_URL_PLACEHOLDER|$DOWNLOAD_URL|g" latest.json
-          sed -i "s/DATE_PLACEHOLDER/$DATE/g" latest.json
-          sed -i "s/COMMIT_PLACEHOLDER/$COMMIT/g" latest.json
+JSONEOF
 
           echo "Generated latest.json:"
           cat latest.json
