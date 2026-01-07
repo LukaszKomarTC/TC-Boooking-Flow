@@ -376,14 +376,26 @@ final class Plugin {
 		];
 
 		// 1) Admin override
-		if ( $is_admin ) {
-			$override = isset($_POST['input_' . self::GF_FIELD_PARTNER_OVERRIDE]) ? (int) $_POST['input_' . self::GF_FIELD_PARTNER_OVERRIDE] : 0;
-			if ( $override > 0 ) {
-				$ctx = $this->partner_ctx_from_user_id($override);
-				$ctx['source'] = 'admin_override';
-				return $ctx;
+			// 1) Admin override
+			if ( $is_admin ) {
+				$override_raw = isset($_POST['input_' . self::GF_FIELD_PARTNER_OVERRIDE]) ? trim((string) $_POST['input_' . self::GF_FIELD_PARTNER_OVERRIDE]) : '';
+				if ( $override_raw !== '' ) {
+					if ( ctype_digit($override_raw) ) {
+						$override_id = (int) $override_raw;
+						if ( $override_id > 0 ) {
+							$ctx = $this->partner_ctx_from_user_id($override_id);
+							$ctx['source'] = 'admin_override_user';
+							return $ctx;
+						}
+					} else {
+						$ctx = $this->partner_ctx_from_code($override_raw);
+						if ( $ctx['coupon_code'] !== '' ) {
+							$ctx['source'] = 'admin_override_code';
+							return $ctx;
+						}
+					}
+				}
 			}
-		}
 
 		// 2) Logged-in hotel user
 		if ( $is_hotel ) {
@@ -442,6 +454,51 @@ final class Plugin {
 		];
 	}
 
+
+		private function partner_ctx_from_code( string $code_raw ) : array {
+			$code_raw = trim($code_raw);
+			if ( $code_raw === '' ) {
+				return [
+					'partner_id' => 0,
+					'partner_email' => '',
+					'coupon_code' => '',
+					'discount_pct' => 0.0,
+					'commission_pct' => 0.0,
+					'source' => 'empty_code',
+				];
+			}
+
+			$code = function_exists('wc_format_coupon_code') ? wc_format_coupon_code($code_raw) : strtolower($code_raw);
+
+			// Find user with matching discount__code
+			$q = new \WP_User_Query([
+				'number'     => 1,
+				'fields'     => 'ids',
+				'meta_query' => [
+					[
+						'key'   => 'discount__code',
+						'value' => $code,
+					],
+				],
+			]);
+			$ids = $q->get_results();
+			$uid = $ids ? (int) $ids[0] : 0;
+			if ( $uid > 0 ) {
+				$ctx = $this->partner_ctx_from_user_id($uid);
+				$ctx['source'] = 'code_lookup';
+				return $ctx;
+			}
+
+			return [
+				'partner_id' => 0,
+				'partner_email' => '',
+				'coupon_code' => $code,
+				'discount_pct' => $this->get_coupon_percent_amount($code),
+				'commission_pct' => 0.0,
+				'source' => 'code_only',
+			];
+		}
+
 	/**
 	 * Read coupon % for percent coupons. Returns 0 if not found or not percent type.
 	 */
@@ -470,17 +527,21 @@ final class Plugin {
 	 */
 	private function gf_register_partner_js_init( int $form_id, array $partners ) : void {
 
-		if ( ! class_exists('\\GFFormDisplay') ) return;
+		if ( ! class_exists('\GFFormDisplay') ) return;
 
 		$map = [];
 		foreach ( $partners as $p ) {
-			$map[(string)$p['id']] = [
+			$row = [
 				'partner_id'      => (int) $p['id'],
 				'partner_email'   => (string) $p['email'],
 				'coupon_code'     => (string) $p['code'],
 				'discount_pct'    => (float) $p['discount_pct'],
 				'commission_pct'  => (float) $p['commission_pct'],
 			];
+			$map[(string)$p['id']] = $row;
+			if ( ! empty($p['code']) ) {
+				$map[(string)$p['code']] = $row; // support dropdown values = coupon code
+			}
 		}
 
 		$json = wp_json_encode($map);
@@ -492,31 +553,91 @@ final class Plugin {
 		$hid_coupon = 'input_' . $form_id . '_' . self::GF_FIELD_COUPON_CODE;
 		$hid_disc_pct = 'input_' . $form_id . '_' . self::GF_FIELD_DISCOUNT_PCT;
 
-		$script = "(function($){\n"
-			. "  var map = {$json} || {};\n"
-			. "  function setVal(domId, v){\n"
-			. "    var el = document.getElementById(domId);\n"
-			. "    if(!el) return;\n"
-			. "    el.value = (v === null || typeof v === 'undefined') ? '' : v;\n"
-			. "    $(el).trigger('change');\n"
-			. "  }\n"
-			. "  function applyPartner(pid){\n"
-			. "    var p = map[String(pid)] || null;\n"
-			. "    if(!p){\n"
-			. "      setVal('{$hid_partner_id}', '');\n"
-			. "      setVal('{$hid_partner_email}', '');\n"
-			. "      setVal('{$hid_comm_pct}', '');\n"
-			. "      setVal('{$hid_coupon}', '');\n"
-			. "      setVal('{$hid_disc_pct}', '');\n"
-			. "      return;\n"
-			. "    }\n"
-			. "    setVal('{$hid_partner_id}', p.partner_id);\n"
-			. "    setVal('{$hid_partner_email}', p.partner_email);\n"
-			. "    setVal('{$hid_comm_pct}', p.commission_pct);\n"
-			. "    setVal('{$hid_coupon}', p.coupon_code);\n"
-			. "    setVal('{$hid_disc_pct}', p.discount_pct);\n"
-			. "  }\n"
-			. "  $(document).on('change', '#{$override_id}', function(){ applyPartner($(this).val()); });\n"
+		$eb_pct_id = 'input_' . $form_id . '_' . self::GF_FIELD_EB_PCT;
+		$eb_amt_id = 'input_' . $form_id . '_' . self::GF_FIELD_EB_AMOUNT;
+		$partner_amt_id = 'input_' . $form_id . '_' . self::GF_FIELD_PARTNER_DISCOUNT_AMT;
+		$total_client_id = 'input_' . $form_id . '_' . self::GF_FIELD_TOTAL_CLIENT;
+
+		$script = "(function($){
+"
+			. "  var map = {$json} || {};
+"
+			. "  function setVal(domId, v){
+"
+			. "    var el = document.getElementById(domId);
+"
+			. "    if(!el) return;
+"
+			. "    el.value = (v === null || typeof v === 'undefined') ? '' : v;
+"
+			. "    $(el).trigger('change');
+"
+			. "  }
+"
+			. "  function showField(fid){ var f=document.getElementById(fid); if(!f) return; f.style.display=''; $(f).find(':input').prop('disabled', false); }
+"
+			. "  function hideField(fid){ var f=document.getElementById(fid); if(!f) return; f.style.display='none'; $(f).find(':input').prop('disabled', true); }
+"
+			. "  function refreshBreakdown(){
+"
+			. "    var ebPct = parseFloat((document.getElementById('{$eb_pct_id}')||{}).value||'0') || 0;
+"
+			. "    var ebAmt = parseFloat((document.getElementById('{$eb_amt_id}')||{}).value||'0') || 0;
+"
+			. "    var pAmt  = parseFloat((document.getElementById('{$partner_amt_id}')||{}).value||'0') || 0;
+"
+			. "    if (ebPct>0 || ebAmt>0) showField('field_{$form_id}_".self::GF_FIELD_EB_AMOUNT."'); else hideField('field_{$form_id}_".self::GF_FIELD_EB_AMOUNT."');
+"
+			. "    if (pAmt>0) showField('field_{$form_id}_".self::GF_FIELD_PARTNER_DISCOUNT_AMT."'); else hideField('field_{$form_id}_".self::GF_FIELD_PARTNER_DISCOUNT_AMT."');
+"
+			. "    if ((document.getElementById('{$total_client_id}')||{}).value) showField('field_{$form_id}_".self::GF_FIELD_TOTAL_CLIENT."');
+"
+			. "  }
+"
+			. "  function applyPartner(key){
+"
+			. "    var p = map[String(key)] || null;
+"
+			. "    if(!p){
+"
+			. "      setVal('{$hid_partner_id}', '');
+"
+			. "      setVal('{$hid_partner_email}', '');
+"
+			. "      setVal('{$hid_comm_pct}', '');
+"
+			. "      setVal('{$hid_coupon}', '');
+"
+			. "      setVal('{$hid_disc_pct}', '');
+"
+			. "      refreshBreakdown();
+"
+			. "      return;
+"
+			. "    }
+"
+			. "    setVal('{$hid_partner_id}', p.partner_id);
+"
+			. "    setVal('{$hid_partner_email}', p.partner_email);
+"
+			. "    setVal('{$hid_comm_pct}', p.commission_pct);
+"
+			. "    setVal('{$hid_coupon}', p.coupon_code);
+"
+			. "    setVal('{$hid_disc_pct}', p.discount_pct);
+"
+			. "    refreshBreakdown();
+"
+			. "  }
+"
+			. "  $(document).on('change', '#{$override_id}', function(){ applyPartner($(this).val()); });
+"
+			. "  $(document).on('change', '#{$eb_pct_id},#{$eb_amt_id},#{$partner_amt_id},#{$total_client_id}', function(){ refreshBreakdown(); });
+"
+			. "  $(document).on('gform_post_render', function(e, formId){ if(parseInt(formId,10)!=={$form_id}) return; refreshBreakdown(); });
+"
+			. "  $(function(){ refreshBreakdown(); });
+"
 			. "})(jQuery);";
 
 		\GFFormDisplay::add_init_script(
@@ -904,198 +1025,100 @@ if ( isset($_POST['input_' . self::GF_FIELD_SUBTOTAL]) ) {
 
 	public function gf_after_submission_add_to_cart( $entry, $form ) {
 
-		// Only run for the configured GF form
-		$form_id = (int) (is_array($form) && isset($form['id']) ? $form['id'] : 0);
-		$target_form_id = \TC_BF\Admin\Settings::get_form_id();
-		if ( $form_id !== $target_form_id ) return;
-
+		if ( ! class_exists('WC') || ! function_exists('WC') || ! WC()->cart ) {
+			return;
+		}
 
 		$entry_id = (int) rgar($entry, 'id');
-		if ( $entry_id <= 0 ) return;
-
-		if ( $this->gf_entry_was_cart_added($entry_id) ) return;
-
-		if ( ! function_exists('WC') || ! WC() || ! WC()->cart ) return;
-
-			// Bulletproof duplicate guard: if the cart already contains an item linked to this GF entry,
-			// do NOT add again (covers refresh/back, retries, or legacy snippet overlap).
-			if ( $this->cart_contains_entry_id($entry_id) ) {
-				$this->log('cart.add.skip.already_in_cart', ['entry_id'=>$entry_id]);
-				$this->gf_entry_mark_cart_added($entry_id);
-				return;
-			}
-
-		$event_id    = (int) rgar($entry, (string) self::GF_FIELD_EVENT_ID);
-		// Prefer the actual event post title (current language). Fall back to GF field.
-		$event_title = $this->localize_post_title( $event_id );
-		if ( $event_title === '' ) {
-			$event_title = (string) rgar($entry, (string) self::GF_FIELD_EVENT_TITLE);
+		if ( $entry_id && $this->gf_entry_is_cart_added($entry_id) ) {
+			return;
 		}
 
-		if ( $event_id <= 0 ) return;
-
-		// Canonical event dates / duration
-		if ( ! function_exists('tc_sc_event_dates') ) return;
-
-		$d = tc_sc_event_dates($event_id);
-		if ( ! is_array($d) || empty($d['start_ts']) || empty($d['end_ts']) ) return;
-
-		$start_ts = (int) $d['start_ts'];
-		$end_ts   = (int) $d['end_ts'];
-
-		// duration days (end exclusive)
-		$duration_days = (int) ceil( max(1, ($end_ts - $start_ts) / DAY_IN_SECONDS ) );
-
-		$start_year  = (int) gmdate('Y', $start_ts);
-		$start_month = (int) gmdate('n', $start_ts);
-		$start_day   = (int) gmdate('j', $start_ts);
-
-		// participant
-		$first = (string) rgar($entry, (string) self::GF_FIELD_FIRST_NAME);
-		$last  = (string) rgar($entry, (string) self::GF_FIELD_LAST_NAME);
-
-		// coupon code (partner)
-		$coupon_code = trim((string) rgar($entry, (string) self::GF_FIELD_COUPON_CODE));
-		$coupon_code = $coupon_code ? wc_format_coupon_code($coupon_code) : '';
-
-		// EB snapshot (once)
-		$calc = $this->calculate_for_event($event_id);
-		$eb_days   = (int)   ($calc['days_before'] ?? 0);
-		$eb_evt_ts = (int)   ($calc['event_start_ts'] ?? 0);
-		$cfg       = (array) ($calc['cfg'] ?? []);
-		$eb_step   = (array) ($calc['step'] ?? []);
-
-		// Determine “with rental” based on your current bike choice concat
-		$bicycle_choice = (string) rgar($entry, (string) self::GF_FIELD_BIKE_130)
-			. (string) rgar($entry, (string) self::GF_FIELD_BIKE_142)
-			. (string) rgar($entry, (string) self::GF_FIELD_BIKE_143)
-			. (string) rgar($entry, (string) self::GF_FIELD_BIKE_169);
-
-		$bicycle_choice_ = explode('_', $bicycle_choice);
-		$product_id_bicycle  = isset($bicycle_choice_[0]) ? (int) $bicycle_choice_[0] : 0;
-		$resource_id_bicycle = isset($bicycle_choice_[1]) ? (int) $bicycle_choice_[1] : 0;
-
-		$has_rental = ($product_id_bicycle > 0 && $resource_id_bicycle > 0);
-
-		$eb_pct_display = 0.0;
-		if ( $eb_step && strtolower((string)($eb_step['type'] ?? 'percent')) === 'percent' ) {
-			$eb_pct_display = (float) ($eb_step['value'] ?? 0.0);
+		$event_id = (int) rgar($entry, (string) self::GF_FIELD_EVENT_ID);
+		if ( ! $event_id ) {
+			return;
 		}
-		$this->log('gf.after_submission.start', [
-			'form_id' => $form_id,
-			'entry_id' => $entry_id,
-			'event_id' => $event_id,
-			'event_title' => $event_title,
-			'has_rental' => $has_rental,
-			'product_id_bicycle' => $product_id_bicycle,
-			'resource_id_bicycle' => $resource_id_bicycle,
-			'eb_pct' => $eb_pct_display,
-			'eb_days' => $eb_days,
-		], 'info');
 
-		/**
-		 * IMPORTANT:
-		 * Your current snippet uses “tour product” as the booking product (and even uses bike resource on it).
-		 * For the new split model, we expect:
-		 * - participation product id resolved from your mapping (existing logic)
-		 * - rental product id = selected bicycle product (bookable)
-		 *
-		 * Until your product scheme is rearranged, we keep a safe fallback:
-		 * If we cannot add a clean participation booking without resources, we keep the legacy single-line behavior.
-		 */
+		$event_slug = (string) rgar($entry, (string) self::GF_FIELD_EVENT_UNIQUE_ID);
+		if ( $event_slug === '' ) {
+			$event_slug = (string) $event_id;
+		}
+
+		// Resolve partner context again from submitted entry (admin override + hotels + manual coupon)
+		$ctx = $this->gf_resolve_partner_context();
+
+		// Participation product id is resolved by plugin logic (event categories etc)
+		$participation_product_id = $this->resolve_participation_product_id($event_id);
+		if ( ! $participation_product_id ) {
+			return;
+		}
 
 		$quantity = 1;
+		$tc_group_id = 'tc_' . $event_slug . '_' . wp_generate_password(8, false, false);
 
-		// ---- Resolve participation product (KEEP: put your mapping here) ----
-		$product_id_participation = $this->resolve_participation_product_id($event_id, $entry);
-		$this->log('resolver.participation.result', ['event_id'=>$event_id,'product_id'=>$product_id_participation]);
+		// Participation custom cost (base after discounts) comes from hidden field 153 if present
+		$base_after_all = $this->money_to_float( rgar($entry, (string) self::GF_FIELD_BASE_AFTER_ALL_DISCOUNTS) );
+		if ( $base_after_all <= 0 ) {
+			// fallback to event price
+			$base_after_all = $this->money_to_float( get_post_meta($event_id, 'event_price', true) );
+		}
+		$base_after_all = max(0.0, $base_after_all);
 
-		if ( $product_id_participation <= 0 ) return;
-
-		$product_part = wc_get_product($product_id_participation);
-		if ( ! $product_part || ! function_exists('is_wc_booking_product') || ! is_wc_booking_product($product_part) ) return;
-
-		// Participation booking posted data (no resource)
-		$sim_post_part = [
-			'wc_bookings_field_duration'         => $duration_days,
-			'wc_bookings_field_start_date_year'  => $start_year,
-			'wc_bookings_field_start_date_month' => $start_month,
-			'wc_bookings_field_start_date_day'   => $start_day,
+		$meta_part = [
+			'tc_group_id' => $tc_group_id,
+			'tc_scope'    => 'participation',
+			'booking'     => [
+				'event_id' => $event_id,
+				'event_slug' => $event_slug,
+				self::BK_CUSTOM_COST => wc_format_decimal($base_after_all, 2),
+			],
+			'tc_partner'  => [
+				'partner_id' => (int) ($ctx['partner_id'] ?? 0),
+				'partner_email' => (string) ($ctx['partner_email'] ?? ''),
+				'coupon_code' => (string) ($ctx['coupon_code'] ?? ''),
+				'discount_pct' => (float) ($ctx['discount_pct'] ?? 0.0),
+				'commission_pct' => (float) ($ctx['commission_pct'] ?? 0.0),
+				'source' => (string) ($ctx['source'] ?? ''),
+			],
 		];
 
-		// If participation product requires resource, but we don't have one, we will fallback to legacy mode.
-		$part_requires_resource = method_exists($product_part, 'has_resources') ? (bool) $product_part->has_resources() : false;
+		WC()->cart->add_to_cart($participation_product_id, $quantity, 0, [], $meta_part);
 
-		// -------------------------
-		// Build participation cart item
-		// -------------------------
-		$cart_item_meta_part = [];
-		$cart_item_meta_part['booking'] = wc_bookings_get_posted_data($sim_post_part, $product_part);
+		// Rental? determine from entry
+		$has_rental = ! empty( rgar($entry, (string) self::GF_FIELD_HAS_RENTAL) );
+		if ( $has_rental ) {
+			$product_id_bicycle = (int) rgar($entry, (string) self::GF_FIELD_BIKE_PRODUCT_ID);
+			$resource_id_bicycle = (int) rgar($entry, (string) self::GF_FIELD_BIKE_RESOURCE_ID);
+			if ( $product_id_bicycle > 0 ) {
+				$rental_price = $this->money_to_float( rgar($entry, (string) self::GF_FIELD_RENTAL_PRICE) );
+				if ( $rental_price <= 0 ) {
+					$bike_type = strtolower(trim((string) rgar($entry, (string) self::GF_FIELD_BIKE_TYPE)));
+					if ( $bike_type !== '' ) {
+						$key = 'rental_price_' . $bike_type;
+						$rental_price = $this->money_to_float( get_post_meta($event_id, $key, true) );
+					}
+				}
+				$rental_price = max(0.0, $rental_price);
 
-		$cart_item_meta_part['booking'][self::BK_EVENT_ID]    = $event_id;
-		$cart_item_meta_part['booking'][self::BK_EVENT_TITLE] = $event_title;
-		$cart_item_meta_part['booking'][self::BK_ENTRY_ID]    = $entry_id;
-		$cart_item_meta_part['booking'][self::BK_SCOPE]       = 'participation';
+				$meta_rental = [
+					'tc_group_id' => $tc_group_id,
+					'tc_scope'    => 'rental',
+					'booking'     => [
+						'event_id' => $event_id,
+						'event_slug' => $event_slug,
+						self::BK_CUSTOM_COST => wc_format_decimal($rental_price, 2),
+					],
+					'tc_partner'  => $meta_part['tc_partner'],
+				];
 
-		$participant_name = trim($first . ' ' . $last);
-		if ( $participant_name !== '' ) {
-			$cart_item_meta_part['booking']['_participant'] = $participant_name;
+				WC()->cart->add_to_cart($product_id_bicycle, $quantity, $resource_id_bicycle, [], $meta_rental);
+			}
 		}
 
-
-		// EB snapshot fields for participation
-		$eligible_part = ! empty($cfg['enabled']) && ! empty($cfg['participation_enabled']);
-		$cart_item_meta_part['booking'][self::BK_EB_ELIGIBLE] = $eligible_part ? 1 : 0;
-		$cart_item_meta_part['booking'][self::BK_EB_DAYS]     = (string) $eb_days;
-		$cart_item_meta_part['booking'][self::BK_EB_EVENT_TS] = (string) $eb_evt_ts;
-
-		/**
-		 * Cost model:
-		 * Participation price comes from event meta (single source of truth).
-		 *
-		 * Keys used today (from your snippets / event metabox):
-		 * - event_price  (participation base)
-		 *
-		 * We always snapshot it into BK_CUSTOM_COST so Woo Bookings cannot drift.
-		 * If meta is missing, we fall back to the GF total as a last-resort safety net.
-		 */
-		$part_price   = $this->money_to_float( get_post_meta($event_id, 'event_price', true) );
-
-// IMPORTANT:
-// - Field 76 (GF "Total") can become discounted if you show EB/partner totals in the form.
-// - For validation we must compare against the *undiscounted* subtotal.
-//   We use field 173 ("S") if present; otherwise we fall back to field 76.
-$posted_subtotal = 0.0;
-if ( isset($_POST['input_' . self::GF_FIELD_SUBTOTAL]) ) {
-	$posted_subtotal = (float) $_POST['input_' . self::GF_FIELD_SUBTOTAL];
-} elseif ( isset($_POST['input_' . self::GF_FIELD_TOTAL]) ) {
-	$posted_subtotal = (float) $_POST['input_' . self::GF_FIELD_TOTAL];
-}
-		$partner_commission = $partner_base_total * ($partner_commission_rate / 100);
-		$client_discount = max(0.0, $partner_base_total - $posted_subtotal);
-
-		$order->update_meta_data('partner_id', (string) $partner_user_id);
-		$order->update_meta_data('partner_code', $partner_code);
-
-		$order->update_meta_data('partner_coupon_type', $partner_coupon_type);
-		$order->update_meta_data('partner_discount_pct', wc_format_decimal($partner_discount_pct, 2));
-		$order->update_meta_data('partner_commission_rate', wc_format_decimal($partner_commission_rate, 2));
-
-		$order->update_meta_data('early_booking_discount_pct', wc_format_decimal($early_booking_discount_pct, 2));
-		$order->update_meta_data('subtotal_original', wc_format_decimal($subtotal_original, 2));
-		$order->update_meta_data('partner_base_total', wc_format_decimal($partner_base_total, 2));
-
-		$order->update_meta_data('client_total', wc_format_decimal($posted_subtotal, 2));
-		$order->update_meta_data('client_discount', wc_format_decimal($client_discount, 2));
-		$order->update_meta_data('partner_commission', wc_format_decimal($partner_commission, 2));
-		$order->update_meta_data('tc_ledger_version', '2');
-
-		$order->save();
+		if ( $entry_id ) {
+			$this->gf_entry_mark_cart_added($entry_id);
+		}
 	}
-
-	/* =========================================================
-	 * EB + partner ledger (snapshot-driven)
-	 * ========================================================= */
 
 	public function eb_write_order_ledger( $order_id, $posted_data, $order ) {
 
