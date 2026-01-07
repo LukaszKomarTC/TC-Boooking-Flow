@@ -68,21 +68,19 @@ jobs:
 
           echo "Creating latest.json with version $VERSION"
 
-          # Create JSON with WordPress plugin update checker format using jq for proper escaping
-          cat > latest.json <<EOF
-{
+          # Create JSON with WordPress plugin update checker format
+          printf '{
   "name": "TC - Booking Flow",
-  "version": "$VERSION",
-  "download_url": "$DOWNLOAD_URL",
+  "version": "%s",
+  "download_url": "%s",
   "requires": "5.0",
   "tested": "6.4",
-  "last_updated": "$DATE",
+  "last_updated": "%s",
   "sections": {
     "description": "WordPress plugin for booking flow integration",
-    "changelog": "<h4>$VERSION</h4><ul><li>Build commit: $COMMIT</li><li>Build date: $DATE</li></ul>"
+    "changelog": "<h4>%s</h4><ul><li>Build commit: %s</li><li>Build date: %s</li></ul>"
   }
-}
-EOF
+}\n' "$VERSION" "$DOWNLOAD_URL" "$DATE" "$VERSION" "$COMMIT" "$DATE" > latest.json
 
           echo "Generated latest.json:"
           cat latest.json
