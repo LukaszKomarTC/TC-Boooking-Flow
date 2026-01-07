@@ -15,6 +15,16 @@ if ( ! defined('TC_BF_URL') ) define('TC_BF_URL', plugin_dir_url(__FILE__));
 // i18n
 if ( ! defined('TC_BF_TEXTDOMAIN') ) define('TC_BF_TEXTDOMAIN', 'tc-booking-flow');
 
+// Initialize plugin update checker
+require_once TC_BF_PATH . 'plugin-update-checker/plugin-update-checker.php';
+use YahnisElsts\PluginUpdateChecker\v5\PucFactory;
+
+$tcBfUpdateChecker = PucFactory::buildUpdateChecker(
+	'https://staging.lukaszkomar.com/dev/tc-booking-flow/latest.json',
+	__FILE__,
+	'tc-booking-flow'
+);
+
 require_once TC_BF_PATH . 'includes/admin/class-tc-bf-admin-product-meta.php';
 require_once TC_BF_PATH . 'includes/admin/class-tc-bf-admin-settings.php';
 require_once TC_BF_PATH . 'includes/admin/class-tc-bf-admin-partners.php';
