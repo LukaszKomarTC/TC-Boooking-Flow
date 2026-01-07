@@ -22,102 +22,115 @@ if ( ! function_exists('tc_sc_event_dates') ) {
         $event_id = (int) $event_id;
         if ( $event_id <= 0 ) return [];
 
+        // Raw timestamps are still stored on the WP post as meta (used for calendar links etc.)
         $start_ts = (int) get_post_meta($event_id, 'sc_event_date_time', true);
-$end_ts   = (int) get_post_meta($event_id, 'sc_event_end_date_time', true);
-
-// Sugar Calendar "all day" can be stored either via sc_event_all_day meta OR via implicit times
-// (00:00 start + 00:00 next-day end, or 00:00 start + 23:59 end on the last day).
-$all_day_meta = get_post_meta($event_id, 'sc_event_all_day', true);
-$is_all_day = in_array( (string) $all_day_meta, array('1','yes','true'), true );
-
-// Heuristic fallback when meta isn't set but the stored times *behave* like all-day.
-// IMPORTANT: We do NOT rely on duration modulo 1 day because timestamps may be stored in UTC
-// while displayed in site timezone (DST/offsets can make the duration "not divisible").
-if ( ! $is_all_day && $start_ts > 0 && $end_ts > 0 ) {
-    $start_hi = date_i18n( 'H:i', $start_ts );
-    $end_hi   = date_i18n( 'H:i', $end_ts );
-
-    // Two common storage patterns for all-day multi-day events:
-    // 1) start 00:00, end 00:00 on the day AFTER the last day (exclusive boundary)
-    // 2) start 00:00, end 23:59 on the last day (inclusive)
-    if ( $start_hi === '00:00' ) {
-        if ( $end_hi === '00:00' ) {
-            // Must span at least 1 day.
-            $start_ymd = date_i18n( 'Y-m-d', $start_ts );
-            $end_ymd   = date_i18n( 'Y-m-d', $end_ts );
-            if ( $end_ymd !== $start_ymd ) {
-                $is_all_day = true;
-            }
-        } elseif ( $end_hi === '23:59' ) {
-            $is_all_day = true;
-        }
-    }
-}
-
+        $end_ts   = (int) get_post_meta($event_id, 'sc_event_end_date_time', true);
 
         if ( $start_ts <= 0 ) return [];
 
-        // NOTE: Sugar Calendar stores timestamps in UTC (unix seconds).
-        // For display we want to mirror SC's behaviour:
-        // - timed single-day:  11/02/2026 10:00 – 13:00
-        // - timed multi-day:   11/02/2026 10:00 – 12/02/2026 13:00
-        // - all-day single:    11/02/2026
-        // - all-day multi:     11/02/2026 – 15/02/2026 (end is inclusive)
+        // ==========================================================
+        // Canonical "all-day" flag: read from Sugar Calendar event object
+        // (NO heuristics based on 00:00 / 23:59).
+        // ==========================================================
+        $is_all_day = false;
 
-        $date_fmt = (string) apply_filters( 'tc_sc_event_date_format', 'd/m/Y', $event_id );
-        $time_fmt = (string) apply_filters( 'tc_sc_event_time_format', 'H:i',   $event_id );
+        if ( function_exists( 'sugar_calendar_get_event_by_object' ) ) {
+            // SC v2+ (events in sc_events/sc_eventmeta) – get event object for this post.
+            // (Call with ONE arg only to avoid signature mismatch fatals across SC builds.)
+            $sc_event = sugar_calendar_get_event_by_object( $event_id );
 
-        $start_date = date_i18n( $date_fmt, $start_ts );
-        $start_time = date_i18n( $time_fmt, $start_ts );
-
-        $end_date = $end_ts ? date_i18n( $date_fmt, $end_ts ) : '';
-        $end_time = $end_ts ? date_i18n( $time_fmt, $end_ts ) : '';
-
-        // For all-day events we need an "inclusive" end date for display.
-        // We support both storage patterns:
-        // - exclusive end boundary at 00:00 of the next day
-        // - inclusive end boundary at 23:59 of the last day
-        $end_inclusive_date = '';
-        if ( $end_ts ) {
-            $end_hi = date_i18n( $time_fmt, $end_ts );
-            if ( $end_hi === '00:00' ) {
-                // Exclusive boundary => subtract one day for display.
-                $end_inclusive_date = date_i18n( $date_fmt, max( 0, (int) $end_ts - DAY_IN_SECONDS ) );
-            } else {
-                // Inclusive (e.g. 23:59) or any other => use same date.
-                $end_inclusive_date = date_i18n( $date_fmt, (int) $end_ts );
+            if ( is_object( $sc_event ) ) {
+                if ( method_exists( $sc_event, 'is_all_day' ) ) {
+                    $is_all_day = (bool) $sc_event->is_all_day();
+                } elseif ( isset( $sc_event->all_day ) ) {
+                    // Some builds expose a property instead.
+                    $is_all_day = (bool) $sc_event->all_day;
+                }
             }
         }
 
-        $same_day_timed = ( $end_ts && date_i18n( 'Y-m-d', $start_ts ) === date_i18n( 'Y-m-d', $end_ts ) );
+        // Fallback only if SC object API is unavailable (older builds): rely on the meta flag if present.
+        if ( ! $is_all_day ) {
+            $all_day_meta = get_post_meta($event_id, 'sc_event_all_day', true);
+            $is_all_day = in_array( (string) $all_day_meta, array('1','yes','true'), true );
+        }
+
+        // ==========================================================
+        // Display formatting – prefer Sugar Calendar helper output
+        // so this matches SC formatting/settings.
+        // ==========================================================
+        $date_text = '';
+        if ( function_exists( 'sc_get_event_date' ) ) {
+            // Returns HTML (<time> tags). Strip tags for header.
+            $date_text = wp_strip_all_tags( (string) sc_get_event_date( $event_id, true ) );
+            $date_text = trim( preg_replace( '/\s+/', ' ', $date_text ) );
+        }
+
+        $time_text = '';
+        if ( ! $is_all_day ) {
+            // Prefer SC time helpers (they respect SC settings).
+            $start_time = function_exists( 'sc_get_event_start_time' ) ? (string) sc_get_event_start_time( $event_id ) : '';
+            $end_time   = function_exists( 'sc_get_event_end_time' )   ? (string) sc_get_event_end_time( $event_id )   : '';
+            $start_time = trim( wp_strip_all_tags( $start_time ) );
+            $end_time   = trim( wp_strip_all_tags( $end_time ) );
+
+            if ( $start_time !== '' ) {
+                $time_text = $start_time;
+                if ( $end_time !== '' && $end_time !== $start_time ) {
+                    $time_text .= ' - ' . $end_time;
+                }
+            }
+        }
+
+        // If SC helpers are not available, fall back to the plugin defaults.
+        if ( $date_text === '' ) {
+            $date_fmt = (string) apply_filters( 'tc_sc_event_date_format', 'd/m/Y', $event_id );
+            $time_fmt = (string) apply_filters( 'tc_sc_event_time_format', 'H:i',   $event_id );
+
+            $start_date = date_i18n( $date_fmt, $start_ts );
+            $start_time = date_i18n( $time_fmt, $start_ts );
+
+            $end_date = $end_ts ? date_i18n( $date_fmt, $end_ts ) : '';
+            $end_time = $end_ts ? date_i18n( $time_fmt, $end_ts ) : '';
+
+            $same_day = ( $end_ts && date_i18n( 'Y-m-d', $start_ts ) === date_i18n( 'Y-m-d', $end_ts ) );
+
+            // For the header we want:
+            // - all-day => date only (range if multi-day)
+            // - timed single-day => date time – time
+            // - timed multi-day => date time – date time
+            if ( $is_all_day ) {
+                if ( ! $end_ts || $same_day ) {
+                    $date_text = $start_date;
+                } else {
+                    $date_text = $start_date . ' - ' . $end_date;
+                }
+                $time_text = '';
+            } else {
+                if ( ! $end_ts ) {
+                    $date_text = $start_date . ' ' . $start_time;
+                    $time_text = '';
+                } elseif ( $same_day ) {
+                    $date_text = $start_date . ' ' . $start_time . ' - ' . $end_time;
+                    $time_text = '';
+                } else {
+                    $date_text = $start_date . ' ' . $start_time . ' - ' . $end_date . ' ' . $end_time;
+                    $time_text = '';
+                }
+            }
+        }
+
+        // Header-friendly formatted string:
+        // - all-day => date only (already a range if multi-day)
+        // - timed   => date + times (single line)
+        $display_header_date = $date_text;
+        if ( ! $is_all_day && $time_text !== '' ) {
+            $display_header_date .= ' ' . $time_text;
+        }
 
         // Back-compat strings (used elsewhere)
-        $display_start = $start_date;
-        $display_end   = $end_date;
-        if ( $same_day_timed ) {
-            $display_end = '';
-        }
-
-        // Header-friendly formatted string
-        $display_header_date = '';
-        if ( $is_all_day ) {
-            // Single-day all-day (common: end is next day 00:00)
-            if ( $end_inclusive_date === '' || $end_inclusive_date === $start_date ) {
-                $display_header_date = $start_date;
-            } else {
-                $display_header_date = $start_date . ' – ' . $end_inclusive_date;
-            }
-        } else {
-            // Timed
-            if ( ! $end_ts ) {
-                $display_header_date = $start_date . ' ' . $start_time;
-            } elseif ( $same_day_timed ) {
-                // Same date -> show only times on the right.
-                $display_header_date = $start_date . ' ' . $start_time . ' – ' . $end_time;
-            } else {
-                $display_header_date = $start_date . ' ' . $start_time . ' – ' . $end_date . ' ' . $end_time;
-            }
-        }
+        $display_start = $date_text;
+        $display_end   = '';
 
         // Availability/range in whole days: start day 00:00 (UTC) +1 day exclusive
         $start_day_utc = (int) strtotime(gmdate('Y-m-d 00:00:00', $start_ts) . ' UTC');
