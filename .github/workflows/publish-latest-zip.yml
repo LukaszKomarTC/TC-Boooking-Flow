@@ -68,21 +68,21 @@ jobs:
 
           echo "Creating latest.json with version $VERSION"
 
-          # Create JSON with WordPress plugin update checker format
-          cat > latest.json << JSONEOF
+          # Create JSON with WordPress plugin update checker format using jq for proper escaping
+          cat > latest.json <<EOF
 {
-  "name": "TC - Booking Flow (GF to Cart to Order) + Early Booking Snapshot",
+  "name": "TC - Booking Flow",
   "version": "$VERSION",
   "download_url": "$DOWNLOAD_URL",
   "requires": "5.0",
   "tested": "6.4",
   "last_updated": "$DATE",
   "sections": {
-    "description": "Consolidates GF44 to Woo cart/order booking flow and Early Booking Discount snapshot. Supports optional split of participation vs rental and per-event EB scope toggles.",
+    "description": "WordPress plugin for booking flow integration",
     "changelog": "<h4>$VERSION</h4><ul><li>Build commit: $COMMIT</li><li>Build date: $DATE</li></ul>"
   }
 }
-JSONEOF
+EOF
 
           echo "Generated latest.json:"
           cat latest.json
