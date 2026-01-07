@@ -107,25 +107,22 @@ jobs:
           echo "================================================================================" >> plugin-full.txt
           echo "" >> plugin-full.txt
 
-          # Include only core plugin PHP files and README
-          for file in tc-booking-flow.php README.txt; do
-            if [ -f "$file" ]; then
-              echo "==== FILE: $file ====" >> plugin-full.txt
-              cat "$file" >> plugin-full.txt
-              echo "" >> plugin-full.txt
-              echo "" >> plugin-full.txt
-            fi
-          done
-
-          # Include all PHP files from includes/ directory
-          if [ -d "includes" ]; then
-            find includes -type f -name "*.php" | sort | while read file; do
-              echo "==== FILE: $file ====" >> plugin-full.txt
+          # Include all plugin files except plugin-update-checker library
+          find . -type f \
+            -not -path "./.git/*" \
+            -not -path "./.github/*" \
+            -not -path "./build/*" \
+            -not -path "./plugin-update-checker/*" \
+            -not -name ".DS_Store" \
+            -not -name "plugin-full.txt" \
+            -not -name ".htaccess" \
+            -not -name "latest.json" \
+            | sort | while read file; do
+              echo "==== FILE: ${file#./} ====" >> plugin-full.txt
               cat "$file" >> plugin-full.txt
               echo "" >> plugin-full.txt
               echo "" >> plugin-full.txt
             done
-          fi
 
           echo "==== END OF SNAPSHOT ====" >> plugin-full.txt
 
