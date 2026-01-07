@@ -22,6 +22,7 @@ jobs:
 
           mkdir -p "$BUILD_DIR/$PLUGIN_SLUG"
 
+          # Copy repo contents into a clean plugin folder (exclude meta/dev folders)
           rsync -av \
             --exclude ".git" \
             --exclude ".github" \
@@ -29,6 +30,7 @@ jobs:
             --exclude ".DS_Store" \
             ./ "$BUILD_DIR/$PLUGIN_SLUG/"
 
+          # Create latest.zip at repo root
           cd "$BUILD_DIR"
           zip -r "../latest.zip" "$PLUGIN_SLUG"
 
@@ -39,7 +41,7 @@ jobs:
           DATE="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
           printf '{"commit":"%s","built_at":"%s"}\n' "$COMMIT" "$DATE" > latest.json
 
-      - name: Upload via SFTP (password)
+      - name: Upload via SFTP (no shell)
         env:
           SFTP_HOST: ${{ secrets.FTP_SERVER }}
           SFTP_USER: ${{ secrets.FTP_USERNAME }}
@@ -47,12 +49,26 @@ jobs:
           REMOTE_DIR: ${{ secrets.FTP_REMOTE_DIR }}
         run: |
           set -e
-
           sudo apt-get update
           sudo apt-get install -y sshpass
 
-          # Create remote dir (ignore error if it already exists)
-          sshpass -p "$SFTP_PASS" ssh -o StrictHostKeyChecking=no -p 22 "$SFTP_USER@$SFTP_HOST" "mkdir -p '$REMOTE_DIR' || true"
+          # SFTP batch script:
+          # - Try to create the dir (may fail if it already exists; we tolerate that)
+          # - cd into it
+          # - upload artifacts
+          cat > sftp-batch.txt <<EOF
+          mkdir $REMOTE_DIR
+          cd $REMOTE_DIR
+          put latest.zip
+          put latest.json
+          bye
+          EOF
 
-          # Upload files
-          sshpass -p "$SFTP_PASS" scp -o StrictHostKeyChecking=no -P 22 latest.zip latest.json "$SFTP_USER@$SFTP_HOST:$REMOTE_DIR/"
+          # Run SFTP in batch mode (no server shell required)
+          sshpass -p "$SFTP_PASS" sftp \
+            -oBatchMode=no \
+            -oStrictHostKeyChecking=no \
+            -oUserKnownHostsFile=/dev/null \
+            -P 22 \
+            -b sftp-batch.txt \
+            "$SFTP_USER@$SFTP_HOST"
