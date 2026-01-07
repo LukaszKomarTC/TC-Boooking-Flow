@@ -57,8 +57,6 @@ jobs:
           unzip -p ../latest.zip "$PLUGIN_SLUG/tc-booking-flow.php" | head -10
 
       - name: Create latest.json
-        env:
-          DOWNLOAD_URL: ${{ secrets.DOWNLOAD_URL }}
         run: |
           set -e
 
@@ -66,6 +64,7 @@ jobs:
           VERSION=$(grep -oP "Version:\s*\K[\d\.]+" tc-booking-flow.php)
           COMMIT="$(git rev-parse --short HEAD)"
           DATE="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          DOWNLOAD_URL="https://staging.lukaszkomar.com/dev/tc-booking-flow/latest.zip"
 
           echo "Creating latest.json with version $VERSION"
 
