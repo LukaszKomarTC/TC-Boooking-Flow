@@ -69,20 +69,19 @@ jobs:
           echo "Creating latest.json with version $VERSION"
 
           # Create JSON with WordPress plugin update checker format
-          printf '{
-  "name": "TC - Booking Flow",
-  "version": "%s",
-  "download_url": "%s",
-  "requires": "5.0",
-  "tested": "6.4",
-  "last_updated": "%s",
-  "sections": {
-    "description": "WordPress plugin for booking flow integration",
-    "changelog": "<h4>%s</h4><ul><li>Build commit: %s</li><li>Build date: %s</li></ul>"
-  }
-}\n' "$VERSION" "$DOWNLOAD_URL" "$DATE" "$VERSION" "$COMMIT" "$DATE" > latest.json
+          echo "{" > latest.json
+          echo "  \"name\": \"TC Booking Flow\"," >> latest.json
+          echo "  \"version\": \"$VERSION\"," >> latest.json
+          echo "  \"download_url\": \"$DOWNLOAD_URL\"," >> latest.json
+          echo "  \"requires\": \"5.0\"," >> latest.json
+          echo "  \"tested\": \"6.4\"," >> latest.json
+          echo "  \"last_updated\": \"$DATE\"," >> latest.json
+          echo "  \"sections\": {" >> latest.json
+          echo "    \"description\": \"WordPress plugin for booking flow integration\"," >> latest.json
+          echo "    \"changelog\": \"Build $COMMIT on $DATE\"" >> latest.json
+          echo "  }" >> latest.json
+          echo "}" >> latest.json
 
-          echo "Generated latest.json:"
           cat latest.json
 
       - name: Install SFTP tools
