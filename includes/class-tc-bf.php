@@ -928,9 +928,10 @@ public function gf_output_partner_js() : void {
 			. "  }\n"
 			. "  var tries=0;\n"
 			. "  (function loop(){ if(bind()) return; tries++; if(tries<20) setTimeout(loop, 250); })();\n"
-			. "  if(window.MutationObserver){\n"
-			. "    try{ var mo=new MutationObserver(function(){ apply(); }); mo.observe(document.body,{childList:true,subtree:true}); }catch(e){}\n"
-			. "  }\n"
+			// NOTE: We intentionally do NOT attach a MutationObserver to document.body.
+			// Calling gformCalculateTotalPrice() mutates the DOM; observing the whole subtree
+			// can create a tight loop (observer -> apply -> recalc -> DOM mutations -> observer ...)
+			// which may freeze the page on some themes/browsers.
 			. "  if(window.jQuery){\n"
 			. "    try{ jQuery(document).on('gform_post_render', function(e, id){ if(parseInt(id,10)===fid) apply(); }); }catch(e){}\n"
 			. "  }\n"
