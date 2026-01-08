@@ -63,6 +63,9 @@ final class Plugin {
 	// Request cache
 	private $calc_cache = [];
 
+	// GF partner dropdown JS payload (per request)
+	private $partner_js_payload = [];
+
 	public static function instance() : self {
 		if ( self::$instance === null ) self::$instance = new self();
 		return self::$instance;
@@ -83,6 +86,14 @@ final class Plugin {
 
 		// ---- GF: server-side validation (tamper-proof + self-heal)
 		add_filter('gform_validation', [ $this, 'gf_validation' ], 10, 1);
+
+
+		// ---- GF: partner + admin override wiring (populate hidden fields + inject JS)
+		add_filter('gform_pre_render',             [ $this, 'gf_partner_prepare_form' ], 10, 1);
+		add_filter('gform_pre_validation',         [ $this, 'gf_partner_prepare_form' ], 10, 1);
+		add_filter('gform_pre_submission_filter',  [ $this, 'gf_partner_prepare_form' ], 10, 1);
+		add_action('wp_footer',                    [ $this, 'gf_output_partner_js' ], 100);
+
 
 		// ---- GF: submission to cart (single source of truth)
 		add_action('gform_after_submission', [ $this, 'gf_after_submission_add_to_cart' ], 10, 2);
@@ -411,6 +422,269 @@ private function cart_contains_entry_id( int $entry_id ) : bool {
 	}
 	return false;
 }
+
+
+
+	/**
+	 * GF: Populate partner fields + inject JS for admin override dropdown (field 63).
+	 *
+	 * Active form id comes from Admin Settings (so clones like 47 work).
+	 */
+	public function gf_partner_prepare_form( $form ) {
+		$form_id = (int) (is_array($form) && isset($form['id']) ? $form['id'] : 0);
+		$target_form_id = (int) \TC_BF\Admin\Settings::get_form_id();
+		if ( $form_id !== $target_form_id ) return $form;
+
+		// Populate hidden partner fields into POST so GF calculations + conditional logic can use them.
+		$this->gf_partner_prepare_post( $form_id );
+
+		// Build partner map for JS (code => data)
+		$partners = $this->get_partner_map_for_js();
+
+		// Cache payload for footer output.
+		$this->partner_js_payload[ $form_id ] = $partners;
+
+		return $form;
+	}
+
+	/**
+	 * Server-side: resolve partner context and write hidden inputs into POST.
+	 * This is required for GF calculation fields (152/154/161/153/166) to compute before submit.
+	 */
+	private function gf_partner_prepare_post( int $form_id ) : void {
+
+		$ctx = $this->resolve_partner_context( $form_id );
+		if ( empty($ctx) || empty($ctx['active']) ) {
+			// Clear fields to avoid stale partner values.
+			$_POST['input_' . self::GF_FIELD_COUPON_CODE] = '';
+			$_POST['input_152'] = '';
+			$_POST['input_161'] = '';
+			$_POST['input_153'] = '';
+			$_POST['input_166'] = '';
+			return;
+		}
+
+		// Write values deterministically.
+		$_POST['input_' . self::GF_FIELD_COUPON_CODE] = (string) ($ctx['code'] ?? '');
+		$_POST['input_152'] = (string) $this->float_to_str( (float) ($ctx['discount_pct'] ?? 0) );
+		$_POST['input_161'] = (string) $this->float_to_str( (float) ($ctx['commission_pct'] ?? 0) );
+		$_POST['input_153'] = (string) ($ctx['partner_email'] ?? '');
+		$_POST['input_166'] = (string) ((int) ($ctx['partner_user_id'] ?? 0));
+	}
+
+	/**
+	 * Priority rule:
+	 * 1) Admin override field 63 (string partner code like "bondia")
+	 * 2) Logged-in partner user meta (discount__code)
+	 * 3) Existing posted coupon code field 154 (manual)
+	 */
+	private function resolve_partner_context( int $form_id ) : array {
+
+		$override_code = isset($_POST['input_63']) ? trim((string) $_POST['input_63']) : '';
+		$override_code = $this->normalize_partner_code( $override_code );
+
+		// 1) Admin override wins (only if current user is admin).
+		if ( $override_code !== '' && current_user_can('administrator') ) {
+			return $this->build_partner_context_from_code( $override_code );
+		}
+
+		// 2) Logged-in partner user (discount__code).
+		if ( is_user_logged_in() ) {
+			$user_id = get_current_user_id();
+			$code_raw = (string) get_user_meta( $user_id, 'discount__code', true );
+			$code = $this->normalize_partner_code( $code_raw );
+			if ( $code !== '' ) {
+				return $this->build_partner_context_from_code( $code, $user_id );
+			}
+		}
+
+		// 3) Manual/posted coupon field 154 (if already present).
+		$posted_code = isset($_POST['input_' . self::GF_FIELD_COUPON_CODE]) ? trim((string) $_POST['input_' . self::GF_FIELD_COUPON_CODE]) : '';
+		$posted_code = $this->normalize_partner_code( $posted_code );
+		if ( $posted_code !== '' ) {
+			return $this->build_partner_context_from_code( $posted_code );
+		}
+
+		return [ 'active' => false ];
+	}
+
+	private function normalize_partner_code( string $code ) : string {
+		$code = trim($code);
+		if ( $code === '' ) return '';
+		if ( function_exists('wc_format_coupon_code') ) {
+			$code = wc_format_coupon_code( $code );
+		}
+		return $code;
+	}
+
+	/**
+	 * Build partner context from a partner code (coupon code).
+	 */
+	private function build_partner_context_from_code( string $code, int $known_user_id = 0 ) : array {
+
+		$code = $this->normalize_partner_code( $code );
+		if ( $code === '' ) return [ 'active' => false ];
+
+		$user_id = $known_user_id;
+		if ( $user_id <= 0 ) {
+			$user_id = $this->find_partner_user_id_by_code( $code );
+		}
+
+		$partner_email = '';
+		$commission_pct = 0.0;
+
+		if ( $user_id > 0 ) {
+			$user = get_user_by('id', $user_id);
+			if ( $user && ! is_wp_error($user) ) {
+				$partner_email = (string) $user->user_email;
+			}
+			$commission_pct = (float) get_user_meta( $user_id, 'usrdiscount', true );
+			if ( $commission_pct < 0 ) $commission_pct = 0.0;
+		}
+
+		$discount_pct = $this->get_coupon_percent_amount( $code );
+
+		return [
+			'active'          => ($discount_pct > 0 || $commission_pct > 0 || $user_id > 0),
+			'code'            => $code,
+			'discount_pct'    => $discount_pct,
+			'commission_pct'  => $commission_pct,
+			'partner_email'   => $partner_email,
+			'partner_user_id' => $user_id,
+		];
+	}
+
+	private function find_partner_user_id_by_code( string $code ) : int {
+		$code = $this->normalize_partner_code( $code );
+		if ( $code === '' ) return 0;
+
+		$uq = new \WP_User_Query([
+			'number'     => 1,
+			'fields'     => 'ID',
+			'meta_query' => [
+				[
+					'key'     => 'discount__code',
+					'value'   => $code,
+					'compare' => '='
+				]
+			]
+		]);
+		$ids = $uq->get_results();
+		if ( is_array($ids) && ! empty($ids) ) return (int) $ids[0];
+		return 0;
+	}
+
+	private function get_coupon_percent_amount( string $code ) : float {
+		$code = $this->normalize_partner_code( $code );
+		if ( $code === '' ) return 0.0;
+		if ( ! class_exists('WC_Coupon') ) return 0.0;
+
+		try {
+			$coupon = new \WC_Coupon( $code );
+			$ctype = (string) $coupon->get_discount_type();
+			if ( $ctype !== 'percent' ) return 0.0;
+			$amt = (float) $coupon->get_amount();
+			if ( $amt < 0 ) $amt = 0.0;
+			return $amt;
+		} catch ( \Throwable $e ) {
+			return 0.0;
+		}
+	}
+
+	private function get_partner_map_for_js() : array {
+
+		$map = [];
+
+		$uq = new \WP_User_Query([
+			'number'     => 200,
+			'fields'     => ['ID','user_email'],
+			'meta_query' => [
+				[
+					'key'     => 'discount__code',
+					'compare' => 'EXISTS',
+				]
+			]
+		]);
+		$users = $uq->get_results();
+		if ( ! is_array($users) ) $users = [];
+
+		foreach ( $users as $u ) {
+			$uid = (int) (is_object($u) && isset($u->ID) ? $u->ID : 0);
+			if ( $uid <= 0 ) continue;
+			$code = (string) get_user_meta( $uid, 'discount__code', true );
+			$code = $this->normalize_partner_code( $code );
+			if ( $code === '' ) continue;
+
+			$commission = (float) get_user_meta( $uid, 'usrdiscount', true );
+			if ( $commission < 0 ) $commission = 0.0;
+
+			$discount = $this->get_coupon_percent_amount( $code );
+
+			$map[ $code ] = [
+				'id'         => $uid,
+				'email'      => (string) (is_object($u) && isset($u->user_email) ? $u->user_email : ''),
+				'commission' => $commission,
+				'discount'   => $discount,
+			];
+		}
+
+		return $map;
+	}
+
+	public function gf_output_partner_js() : void {
+
+		if ( empty($this->partner_js_payload) ) return;
+		if ( is_admin() ) return;
+
+		foreach ( $this->partner_js_payload as $form_id => $partners ) {
+			$form_id = (int) $form_id;
+			if ( $form_id <= 0 ) continue;
+
+			$json = wp_json_encode($partners);
+
+			echo "\n<script id=\"tc-bf-partner-override-{$form_id}\">\n";
+			echo "window.tcBfPartnerMap = window.tcBfPartnerMap || {};\n";
+			echo "window.tcBfPartnerMap[{$form_id}] = {$json};\n";
+			echo "(function($){\n";
+			echo "  function tcBfApplyPartner(fid){\n";
+			echo "    var map = (window.tcBfPartnerMap && window.tcBfPartnerMap[fid]) ? window.tcBfPartnerMap[fid] : {};\n";
+			echo "    var $sel = $('#input_'+fid+'_63');\n";
+			echo "    if(!$sel.length) return;\n";
+			echo "    var code = ($sel.val()||'').toString().trim();\n";
+			echo "    var data = code && map[code] ? map[code] : null;\n";
+			echo "    var setVal = function(fieldId,val){ var $i=$('#input_'+fid+'_'+fieldId); if(!$i.length) return; $i.val(val); $i.trigger('change'); };\n";
+			echo "    if(!data){\n";
+			echo "      setVal(154,''); setVal(152,''); setVal(161,''); setVal(153,''); setVal(166,'');\n";
+			echo "    } else {\n";
+			echo "      setVal(154,code);\n";
+			echo "      setVal(152,(data.discount||''));\n";
+			echo "      setVal(161,(data.commission||''));\n";
+			echo "      setVal(153,(data.email||''));\n";
+			echo "      setVal(166,(data.id||''));\n";
+			echo "    }\n";
+			echo "    var showField = function(fieldId){ var $f=$('#field_'+fid+'_'+fieldId); if($f.length){ $f.show(); $f.attr('data-conditional-logic','visible'); } var $i=$('#input_'+fid+'_'+fieldId); if($i.length){ $i.prop('disabled',false); } };\n";
+			echo "    var hideField = function(fieldId){ var $f=$('#field_'+fid+'_'+fieldId); if($f.length){ $f.hide(); $f.attr('data-conditional-logic','hidden'); } };\n";
+			echo "    if(data && code){ showField(176); showField(164); showField(168); showField(165); } else { hideField(176); hideField(165); }\n";
+			echo "    var $wrap = $('#field_'+fid+'_177 .tc-bf-price-summary');\n";
+			echo "    if($wrap.length){\n";
+			echo "      var ebPct = parseFloat($('#input_'+fid+'_172').val()||0)||0;\n";
+			echo "      $wrap.find('.tc-bf-eb-line').toggle(ebPct>0);\n";
+			echo "      $wrap.find('.tc-bf-partner-line').toggle(!!(data && code));\n";
+			echo "      var comm = parseFloat($('#input_'+fid+'_161').val()||0)||0;\n";
+			echo "      $wrap.find('.tc-bf-commission').toggle(comm>0 && !!(data && code));\n";
+			echo "    }\n";
+			echo "    if(typeof window.gformCalculateTotalPrice === 'function'){ try{ window.gformCalculateTotalPrice(fid); }catch(e){} }\n";
+			echo "  }\n";
+			echo "  $(document).on('gform_post_render', function(e,fid){ if(parseInt(fid,10)==={$form_id}){ tcBfApplyPartner({$form_id}); $('#input_'+{$form_id}+'_63').off('change.tcBf').on('change.tcBf', function(){ tcBfApplyPartner({$form_id}); }); }});\n";
+			echo "  $(function(){ tcBfApplyPartner({$form_id}); $('#input_'+{$form_id}+'_63').off('change.tcBf').on('change.tcBf', function(){ tcBfApplyPartner({$form_id}); }); });\n";
+			echo "})(jQuery);\n";
+			echo "</script>\n";
+		}
+	}
+
+	private function float_to_str( float $v ) : string {
+		return rtrim(rtrim(number_format($v, 2, '.', ''), '0'), '.');
+	}
 
 
 	public function gf_populate_eb_pct( $value ) {
