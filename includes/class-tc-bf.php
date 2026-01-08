@@ -1634,6 +1634,15 @@ public function gf_output_partner_js() : void {
 	}
 
 	/**
+	 * Round money values to currency cents consistently.
+	 * We round at each ledger output step to avoid 0.01 drift between GF and PHP.
+	 */
+	private function money_round( float $v ) : float {
+		// tiny epsilon mitigates binary float artifacts like 19.999999 -> 20.00
+		return round($v + 1e-9, 2);
+	}
+
+	/**
 	 * Resolve a rental price (fixed per event) based on GF rental type or rental product category.
 	 * Event meta keys used by current snippets:
 	 * - rental_price_road
@@ -1795,14 +1804,17 @@ public function gf_output_partner_js() : void {
 			}
 		}
 		if ( $subtotal_original <= 0 ) $subtotal_original = (float) $order->get_subtotal();
+		$subtotal_original = $this->money_round( (float) $subtotal_original );
 
 		// EB pct stored on order later by ledger; here we set placeholder 0 (ledger updates after)
 		$early_booking_discount_pct = 0.0;
 		$partner_base_total = $subtotal_original;
 
-		$client_total = $partner_base_total * (1 - ($partner_discount_pct / 100));
-		$partner_commission = $partner_base_total * ($partner_commission_rate / 100);
-		$client_discount = max(0.0, $partner_base_total - $client_total);
+		$partner_base_total = $this->money_round( (float) $partner_base_total );
+
+		$client_total = $this->money_round( $partner_base_total * (1 - ($partner_discount_pct / 100)) );
+		$partner_commission = $this->money_round( $partner_base_total * ($partner_commission_rate / 100) );
+		$client_discount = $this->money_round( max(0.0, $partner_base_total - $client_total) );
 
 		$order->update_meta_data('partner_id', (string) $partner_user_id);
 		$order->update_meta_data('partner_code', $partner_code);
@@ -1876,15 +1888,19 @@ public function gf_output_partner_js() : void {
 
 		if ( $subtotal_original <= 0 ) return;
 
+		// Normalize monetary aggregates to currency cents to prevent 0.01 drift.
+		$subtotal_original = $this->money_round( (float) $subtotal_original );
+		$eb_amount_total   = $this->money_round( (float) $eb_amount_total );
+
 		$partner_discount_pct    = (float) $order->get_meta('partner_discount_pct', true);
 		$partner_commission_rate = (float) $order->get_meta('partner_commission_rate', true);
 		if ( $partner_discount_pct < 0 ) $partner_discount_pct = 0;
 		if ( $partner_commission_rate < 0 ) $partner_commission_rate = 0;
 
-		$partner_base_total = max(0, $subtotal_original - $eb_amount_total);
-		$client_total       = $partner_base_total * (1 - ($partner_discount_pct / 100));
-		$partner_commission = $partner_base_total * ($partner_commission_rate / 100);
-		$client_discount    = max(0.0, $partner_base_total - $client_total);
+		$partner_base_total = $this->money_round( max(0, $subtotal_original - $eb_amount_total) );
+		$client_total       = $this->money_round( $partner_base_total * (1 - ($partner_discount_pct / 100)) );
+		$partner_commission = $this->money_round( $partner_base_total * ($partner_commission_rate / 100) );
+		$client_discount    = $this->money_round( max(0.0, $partner_base_total - $client_total) );
 
 		$order->update_meta_data('subtotal_original', wc_format_decimal($subtotal_original, 2));
 
