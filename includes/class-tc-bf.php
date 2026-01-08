@@ -1025,6 +1025,25 @@ public function gf_output_partner_js() : void {
 					return s.replace('.', ',');
 				}
 
+					function toDotNumber(val){
+						val = (val==null ? '' : String(val));
+						// strip currency and spaces
+						val = val.replace(/\s+/g,'').replace(/€/g,'');
+						// keep digits, comma, dot and minus
+						val = val.replace(/[^0-9,\.\-]/g,'');
+						if(!val) return '';
+						// If only comma present, treat it as decimal.
+						if(val.indexOf(',') !== -1 && val.indexOf('.') === -1){
+							val = val.replace(',', '.');
+						} else if(val.indexOf(',') !== -1 && val.indexOf('.') !== -1){
+							// if both exist, assume dot thousands and comma decimal (e.g. 1.234,56)
+							val = val.replace(/\./g,'').replace(',', '.');
+						}
+						var num = parseFloat(val);
+						if(!isFinite(num) || num < 0) num = 0;
+						return num.toFixed(2);
+					}
+
 				function ensureDisplay(formId, fieldId, formatted){
 					var fieldWrap = document.getElementById('field_' + formId + '_' + fieldId);
 					if(!fieldWrap) return;
@@ -1042,6 +1061,22 @@ public function gf_output_partner_js() : void {
 					// Only act if this form exists in DOM.
 					if(!document.getElementById('gform_' + formId) && !document.getElementById('gform_wrapper_' + formId)) return;
 
+					// Debounced total recalculation (safe: no observers, guarded).
+					if(!apply._tcRecalcTimers) apply._tcRecalcTimers = {};
+					if(!apply._tcRecalcBusy) apply._tcRecalcBusy = {};
+					function recalcSoon(){
+						try{
+							if(apply._tcRecalcBusy[formId]) return;
+							if(apply._tcRecalcTimers[formId]){ clearTimeout(apply._tcRecalcTimers[formId]); }
+							apply._tcRecalcTimers[formId] = setTimeout(function(){
+								apply._tcRecalcTimers[formId] = null;
+								apply._tcRecalcBusy[formId] = true;
+								try{ if(typeof window.gformCalculateTotalPrice === 'function') window.gformCalculateTotalPrice(formId); } catch(e){}
+								apply._tcRecalcBusy[formId] = false;
+							}, 120);
+						}catch(e){}
+					}
+
 					Object.keys(cfg.prices).forEach(function(fidStr){
 						var fieldId = parseInt(fidStr, 10);
 						if(!fieldId) return;
@@ -1056,7 +1091,24 @@ public function gf_output_partner_js() : void {
 						if(!inp) return;
 
 						// Force parse-safe numeric.
-						inp.value = dot;
+							// NOTE: GF may rewrite this input with localized currency text after conditional logic.
+							// We enforce a raw numeric (dot-decimal) value and then trigger a safe recalc.
+							inp.value = dot;
+							try{ inp.setAttribute('value', dot); } catch(e){}
+								setTimeout(function(){ try{ inp.value = dot; inp.setAttribute('value', dot); } catch(e){} }, 0);
+								setTimeout(function(){ try{ inp.value = dot; inp.setAttribute('value', dot); } catch(e){} }, 80);
+								setTimeout(function(){
+									try{
+										var cur = toDotNumber(inp.value);
+										if(cur !== dot){ inp.value = dot; inp.setAttribute('value', dot); }
+									}catch(e){}
+								}, 260);
+								setTimeout(function(){
+									try{
+										var cur2 = toDotNumber(inp.value);
+										if(cur2 !== dot){ inp.value = dot; inp.setAttribute('value', dot); }
+									}catch(e){}
+								}, 520);
 
 						// If this input is visible (some GF configs show it), hide and provide a formatted display span.
 						try{
@@ -1078,6 +1130,10 @@ public function gf_output_partner_js() : void {
 						// Keep visible label formatted (comma + euro).
 						ensureDisplay(formId, fieldId, dotToComma(dot) + ' €');
 					});
+
+							// After enforcing numeric base prices, kick a single recalculation (delayed
+							// to allow GF conditional logic to finish rewriting inputs).
+							setTimeout(function(){ try{ recalcSoon(); } catch(e){} }, 560);
 				}
 
 				// Initial + GF events
@@ -1090,6 +1146,8 @@ public function gf_output_partner_js() : void {
 					window.jQuery(document).on('gform_post_conditional_logic', function(e, formId){
 						if(parseInt(formId,10) === parseInt(cfg.formId,10)) apply(cfg.formId);
 					});
+						// Also bind to rental-type selector changes (field 106) as an extra safety net.
+						window.jQuery(document).on('change', '#input_' + cfg.formId + '_106', function(){ apply(cfg.formId); });
 				}
 			} catch(err) {}
 		})();
