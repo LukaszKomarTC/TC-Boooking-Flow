@@ -81,6 +81,9 @@ final class Plugin {
 			\TC_BF\Admin\Partners::init();
 		}
 
+		// ---- Frontend: force Gravity Forms number format for decimal_comma locales (prevents 30,00 => 3000 on recalcs)
+		add_action('wp_head', [ $this, 'gf_force_decimal_comma_number_format' ], 1);
+
 		// ---- GF: dynamic EB% population (field 172)
 		add_filter('gform_field_value_early_booking_discount_pct', [ $this, 'gf_populate_eb_pct' ]);
 
@@ -765,6 +768,20 @@ private function cart_contains_entry_id( int $entry_id ) : bool {
 			. "    }catch(e){}\n"
 			. "  }\n"
 			. "})();\n";
+	}
+
+
+
+	/**
+	 * Ensure Gravity Forms uses decimal_comma parsing on this site.
+	 * This must run BEFORE GF inline scripts set a default (they set decimal_dot if undefined).
+	 * It prevents values like "30,00 €" from being parsed as 3000 during conditional logic recalcs.
+	 */
+	public function gf_force_decimal_comma_number_format() : void {
+		if ( is_admin() ) return;
+
+		// Only set if not already set by theme/other plugin.
+		echo "\n<script id=\"tc-bf-gf-number-format\">window.gf_number_format = window.gf_number_format || 'decimal_comma';</script>\n";
 	}
 
 public function gf_output_partner_js() : void {
