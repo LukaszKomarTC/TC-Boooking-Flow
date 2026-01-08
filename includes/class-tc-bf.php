@@ -441,8 +441,18 @@ private function cart_contains_entry_id( int $entry_id ) : bool {
 		// Build partner map for JS (code => data)
 		$partners = $this->get_partner_map_for_js();
 
+		// Determine initial partner code from context (admin override > logged-in partner > posted code)
+		$ctx = $this->resolve_partner_context( $form_id );
+		$initial_code = ( ! empty($ctx) && ! empty($ctx['active']) && ! empty($ctx['code']) ) ? (string) $ctx['code'] : '';
+
 		// Cache payload for footer output.
-		$this->partner_js_payload[ $form_id ] = $partners;
+		$this->partner_js_payload[ $form_id ] = [
+			'partners'     => $partners,
+			'initial_code' => $initial_code,
+		];
+
+		// Also register an init script so this works even when GF renders via AJAX.
+		$this->gf_register_partner_init_script( $form_id, $partners, $initial_code );
 
 		return $form;
 	}
@@ -631,54 +641,150 @@ private function cart_contains_entry_id( int $entry_id ) : bool {
 		return $map;
 	}
 
-	public function gf_output_partner_js() : void {
+	
+	private function gf_register_partner_init_script( int $form_id, array $partners, string $initial_code = '' ) : void {
+		if ( $form_id <= 0 ) return;
+		if ( ! class_exists('\GFFormDisplay') ) return;
 
-		if ( empty($this->partner_js_payload) ) return;
+		$script = $this->build_partner_override_js( $form_id, $partners, $initial_code );
+		if ( $script === '' ) return;
+
+		// Runs reliably for normal and AJAX-rendered forms.
+		\GFFormDisplay::add_init_script(
+			$form_id,
+			'tc_bf_partner_override_' . $form_id,
+			\GFFormDisplay::ON_PAGE_RENDER,
+			$script
+		);
+	}
+
+	private function build_partner_override_js( int $form_id, array $partners, string $initial_code = '' ) : string {
+
+		// Map: { code => {id,email,commission,discount} }
+		$json = wp_json_encode( $partners );
+
+		// IMPORTANT: this is raw JS (no <script> wrapper). GF will wrap it.
+		return "window.tcBfPartnerMap = window.tcBfPartnerMap || {};\n"
+			. "window.tcBfPartnerMap[{$form_id}] = {$json};\n"
+			. "(function(){\n"
+			. "  var fid = {$form_id};\n"
+			. "  var initialCode = '" . esc_js( $initial_code ) . "';\n"
+			. "  function qs(sel,root){ return (root||document).querySelector(sel); }\n"
+			. "  function parseLocaleFloat(v){\n"
+			. "    if(v===null||typeof v==='undefined') return 0;\n"
+			. "    if(typeof v==='string') v = v.replace(',', '.');\n"
+			. "    var n = parseFloat(v);\n"
+			. "    return isNaN(n) ? 0 : n;\n"
+			. "  }\n"
+			. "  function fmtPct(v){\n"
+			. "    if(v===null||typeof v==='undefined') return '';\n"
+			. "    var s = String(v).trim();\n"
+			. "    if(!s) return '';\n"
+			. "    // Gravity Forms uses decimal_comma on this site; feed percentages as 7,5 not 7.5\n"
+			. "    if(s.indexOf(',') !== -1) return s;\n"
+			. "    if(s.indexOf('.') !== -1) return s.replace('.', ',');\n"
+			. "    return s;\n"
+			. "  }\n"
+			. "  function setVal(fieldId, val){\n"
+			. "    var el = qs('#input_'+fid+'_'+fieldId);\n"
+			. "    if(!el) return;\n"
+			. "    el.value = (val===null||typeof val==='undefined') ? '' : String(val);\n"
+			. "    try{ el.dispatchEvent(new Event('change', {bubbles:true})); }catch(e){}\n"
+			. "  }\n"
+			. "  function showField(fieldId){\n"
+			. "    var wrap = qs('#field_'+fid+'_'+fieldId);\n"
+			. "    if(wrap){ wrap.style.display=''; wrap.setAttribute('data-conditional-logic','visible'); }\n"
+			. "    var el = qs('#input_'+fid+'_'+fieldId);\n"
+			. "    if(el){ el.disabled=false; }\n"
+			. "  }\n"
+			. "  function hideField(fieldId){\n"
+			. "    var wrap = qs('#field_'+fid+'_'+fieldId);\n"
+			. "    if(wrap){ wrap.style.display='none'; wrap.setAttribute('data-conditional-logic','hidden'); }\n"
+			. "    var el = qs('#input_'+fid+'_'+fieldId);\n"
+			. "    if(el){ el.disabled=true; }\n"
+			. "  }\n"
+			. "  function toggleSummary(data, code){\n"
+			. "    var summary = qs('#field_'+fid+'_177 .tc-bf-price-summary');\n"
+			. "    if(!summary) return;\n"
+			. "    var ebPct = parseLocaleFloat((qs('#input_'+fid+'_172')||{}).value||0);\n"
+			. "    var ebLine = qs('.tc-bf-eb-line', summary);\n"
+			. "    if(ebLine) ebLine.style.display = (ebPct>0) ? '' : 'none';\n"
+			. "    var pLine = qs('.tc-bf-partner-line', summary);\n"
+			. "    if(pLine) pLine.style.display = (data && code) ? '' : 'none';\n"
+			. "    var commPct = parseLocaleFloat((qs('#input_'+fid+'_161')||{}).value||0);\n"
+			. "    var cLine = qs('.tc-bf-commission', summary);\n"
+			. "    if(cLine) cLine.style.display = (commPct>0 && data && code) ? '' : 'none';\n"
+			. "  }\n"
+			. "  function applyPartner(){\n"
+			. "    var map = (window.tcBfPartnerMap && window.tcBfPartnerMap[fid]) ? window.tcBfPartnerMap[fid] : {};\n"
+			. "    var sel = qs('#input_'+fid+'_63');\n"
+			. "    var code = '';\n"
+			. "    if(sel){ code = (sel.value||'').toString().trim(); }\n"
+			. "    if(!code){ var codeEl = qs('#input_'+fid+'_154'); if(codeEl) code = (codeEl.value||'').toString().trim(); }\n"
+			. "    if(!code && initialCode){ code = (initialCode||'').toString().trim(); }\n"
+			. "    // If admin override select exists and is empty, set it for consistency (best effort).\n"
+			. "    if(sel && code && sel.value !== code){ try{ sel.value = code; }catch(e){} }\n"
+			. "    var data = (code && map && map[code]) ? map[code] : null;\n"
+			. "    if(!data){\n"
+			. "      setVal(154,''); setVal(152,''); setVal(161,''); setVal(153,''); setVal(166,'');\n"
+			. "      hideField(176); hideField(165);\n"
+			. "    } else {\n"
+			. "      setVal(154,code);\n"
+			. "      setVal(152, fmtPct(data.discount||''));\n"
+			. "      setVal(161, fmtPct(data.commission||''));\n"
+			. "      setVal(153,(data.email||''));\n"
+			. "      setVal(166,(data.id||''));\n"
+			. "      showField(176); showField(165);\n"
+			. "    }\n"
+			. "    toggleSummary(data, code);\n"
+			. "    if(typeof window.gformCalculateTotalPrice === 'function'){\n"
+			. "      try{ window.gformCalculateTotalPrice(fid); }catch(e){}\n"
+			. "    }\n"
+			. "  }\n"
+			. "  function bind(){\n"
+			. "    var sel = qs('#input_'+fid+'_63');\n"
+			. "    if(sel && !sel.__tcBfBound){\n"
+			. "      sel.__tcBfBound = true;\n"
+			. "      sel.addEventListener('change', applyPartner);\n"
+			. "    }\n"
+			. "    // Always apply once (supports logged-in partner context even if field 63 is hidden/absent).\n"
+			. "    applyPartner();\n"
+			. "    return true;\n"
+			. "  }\n"
+			. "  // Try now, then retry a few times.\n"
+			. "  var tries = 0;\n"
+			. "  (function loop(){\n"
+			. "    if(bind()) return;\n"
+			. "    tries++; if(tries<20) setTimeout(loop, 250);\n"
+			. "  })();\n"
+			. "  // Also watch for late DOM injection (popups, AJAX embeds).\n"
+			. "  if(window.MutationObserver){\n"
+			. "    try{\n"
+			. "      var mo = new MutationObserver(function(){ bind(); });\n"
+			. "      mo.observe(document.body, {childList:true, subtree:true});\n"
+			. "    }catch(e){}\n"
+			. "  }\n"
+			. "})();\n";
+	}
+
+public function gf_output_partner_js() : void {
+
+		if ( empty( $this->partner_js_payload ) ) return;
 		if ( is_admin() ) return;
 
-		foreach ( $this->partner_js_payload as $form_id => $partners ) {
+		foreach ( $this->partner_js_payload as $form_id => $payload ) {
 			$form_id = (int) $form_id;
 			if ( $form_id <= 0 ) continue;
 
-			$json = wp_json_encode($partners);
+			$partners = (is_array($payload) && isset($payload['partners']) && is_array($payload['partners'])) ? $payload['partners'] : [];
+			$initial_code = (is_array($payload) && isset($payload['initial_code'])) ? (string) $payload['initial_code'] : '';
+
+			$js = $this->build_partner_override_js( $form_id, $partners, $initial_code );
+			if ( $js === '' ) continue;
 
 			echo "\n<script id=\"tc-bf-partner-override-{$form_id}\">\n";
-			echo "window.tcBfPartnerMap = window.tcBfPartnerMap || {};\n";
-			echo "window.tcBfPartnerMap[{$form_id}] = {$json};\n";
-			echo "(function($){\n";
-			echo "  function tcBfApplyPartner(fid){\n";
-			echo "    var map = (window.tcBfPartnerMap && window.tcBfPartnerMap[fid]) ? window.tcBfPartnerMap[fid] : {};\n";
-			echo "    var $sel = $('#input_'+fid+'_63');\n";
-			echo "    if(!$sel.length) return;\n";
-			echo "    var code = ($sel.val()||'').toString().trim();\n";
-			echo "    var data = code && map[code] ? map[code] : null;\n";
-			echo "    var setVal = function(fieldId,val){ var $i=$('#input_'+fid+'_'+fieldId); if(!$i.length) return; $i.val(val); $i.trigger('change'); };\n";
-			echo "    if(!data){\n";
-			echo "      setVal(154,''); setVal(152,''); setVal(161,''); setVal(153,''); setVal(166,'');\n";
-			echo "    } else {\n";
-			echo "      setVal(154,code);\n";
-			echo "      setVal(152,(data.discount||''));\n";
-			echo "      setVal(161,(data.commission||''));\n";
-			echo "      setVal(153,(data.email||''));\n";
-			echo "      setVal(166,(data.id||''));\n";
-			echo "    }\n";
-			echo "    var showField = function(fieldId){ var $f=$('#field_'+fid+'_'+fieldId); if($f.length){ $f.show(); $f.attr('data-conditional-logic','visible'); } var $i=$('#input_'+fid+'_'+fieldId); if($i.length){ $i.prop('disabled',false); } };\n";
-			echo "    var hideField = function(fieldId){ var $f=$('#field_'+fid+'_'+fieldId); if($f.length){ $f.hide(); $f.attr('data-conditional-logic','hidden'); } };\n";
-			echo "    if(data && code){ showField(176); showField(164); showField(168); showField(165); } else { hideField(176); hideField(165); }\n";
-			echo "    var $wrap = $('#field_'+fid+'_177 .tc-bf-price-summary');\n";
-			echo "    if($wrap.length){\n";
-			echo "      var ebPct = parseFloat($('#input_'+fid+'_172').val()||0)||0;\n";
-			echo "      $wrap.find('.tc-bf-eb-line').toggle(ebPct>0);\n";
-			echo "      $wrap.find('.tc-bf-partner-line').toggle(!!(data && code));\n";
-			echo "      var comm = parseFloat($('#input_'+fid+'_161').val()||0)||0;\n";
-			echo "      $wrap.find('.tc-bf-commission').toggle(comm>0 && !!(data && code));\n";
-			echo "    }\n";
-			echo "    if(typeof window.gformCalculateTotalPrice === 'function'){ try{ window.gformCalculateTotalPrice(fid); }catch(e){} }\n";
-			echo "  }\n";
-			echo "  $(document).on('gform_post_render', function(e,fid){ if(parseInt(fid,10)==={$form_id}){ tcBfApplyPartner({$form_id}); $('#input_'+{$form_id}+'_63').off('change.tcBf').on('change.tcBf', function(){ tcBfApplyPartner({$form_id}); }); }});\n";
-			echo "  $(function(){ tcBfApplyPartner({$form_id}); $('#input_'+{$form_id}+'_63').off('change.tcBf').on('change.tcBf', function(){ tcBfApplyPartner({$form_id}); }); });\n";
-			echo "})(jQuery);\n";
-			echo "</script>\n";
+			echo $js;
+			echo "\n</script>\n";
 		}
 	}
 
@@ -1006,13 +1112,13 @@ private function cart_contains_entry_id( int $entry_id ) : bool {
 			if ( $eb_total_amt > 0 ) {
 				// Proportional distribution with rounding.
 				if ( isset($eligible_bases['part']) && $eligible_bases['part'] > 0 ) {
-					$eb_amt_part = round($eb_total_amt * ($eligible_bases['part'] / $eligible_sum), 2);
+					$eb_amt_part = $this->money_round($eb_total_amt * ($eligible_bases['part'] / $eligible_sum));
 				}
 				if ( isset($eligible_bases['rental']) && $eligible_bases['rental'] > 0 ) {
-					$eb_amt_rental = round($eb_total_amt * ($eligible_bases['rental'] / $eligible_sum), 2);
+					$eb_amt_rental = $this->money_round($eb_total_amt * ($eligible_bases['rental'] / $eligible_sum));
 				}
 				// Fix rounding drift on last eligible line.
-				$drift = round($eb_total_amt - ($eb_amt_part + $eb_amt_rental), 2);
+				$drift = $this->money_round($eb_total_amt - ($eb_amt_part + $eb_amt_rental));
 				if ( abs($drift) > 0.0001 ) {
 					if ( isset($eligible_bases['rental']) ) {
 						$eb_amt_rental = max(0.0, $eb_amt_rental + $drift);
@@ -1373,9 +1479,11 @@ private function cart_contains_entry_id( int $entry_id ) : bool {
 			}
 
 			if ( $amt > 0 ) {
-				$new = round( $base - $amt, 2 );
+				$disc = $this->money_round($amt);
+				$new  = $this->money_round($base - $disc);
 			} else {
-				$new = round( $base * (1 - ($pct/100)), 2 );
+				$disc = $this->money_round($base * ($pct/100));
+				$new  = $this->money_round($base - $disc);
 			}
 			if ( $new < 0 ) $new = 0;
 
@@ -1525,6 +1633,15 @@ private function cart_contains_entry_id( int $entry_id ) : bool {
 			if ( substr_count($s, ',') > 1 ) $s = str_replace(',', '', $s);
 		}
 		return is_numeric($s) ? (float) $s : 0.0;
+	}
+
+	/**
+	 * Round money values to currency cents consistently.
+	 * We round at each ledger output step to avoid 0.01 drift between GF and PHP.
+	 */
+	private function money_round( float $v ) : float {
+		// tiny epsilon mitigates binary float artifacts like 19.999999 -> 20.00
+		return round($v + 1e-9, 2);
 	}
 
 	/**
@@ -1689,14 +1806,19 @@ private function cart_contains_entry_id( int $entry_id ) : bool {
 			}
 		}
 		if ( $subtotal_original <= 0 ) $subtotal_original = (float) $order->get_subtotal();
+		$subtotal_original = $this->money_round( (float) $subtotal_original );
 
 		// EB pct stored on order later by ledger; here we set placeholder 0 (ledger updates after)
 		$early_booking_discount_pct = 0.0;
 		$partner_base_total = $subtotal_original;
 
-		$client_total = $partner_base_total * (1 - ($partner_discount_pct / 100));
-		$partner_commission = $partner_base_total * ($partner_commission_rate / 100);
-		$client_discount = max(0.0, $partner_base_total - $client_total);
+		$partner_base_total = $this->money_round( (float) $partner_base_total );
+
+		// IMPORTANT: round discount amount first, then derive totals from rounded components.
+		// This matches the GF UI where discount lines are rounded and total is computed as base - discount.
+		$client_discount    = $this->money_round( $partner_base_total * ($partner_discount_pct / 100) );
+		$client_total       = $this->money_round( max(0.0, $partner_base_total - $client_discount) );
+		$partner_commission = $this->money_round( $partner_base_total * ($partner_commission_rate / 100) );
 
 		$order->update_meta_data('partner_id', (string) $partner_user_id);
 		$order->update_meta_data('partner_code', $partner_code);
@@ -1770,15 +1892,22 @@ private function cart_contains_entry_id( int $entry_id ) : bool {
 
 		if ( $subtotal_original <= 0 ) return;
 
+		// Normalize monetary aggregates to currency cents to prevent 0.01 drift.
+		$subtotal_original = $this->money_round( (float) $subtotal_original );
+		$eb_amount_total   = $this->money_round( (float) $eb_amount_total );
+
 		$partner_discount_pct    = (float) $order->get_meta('partner_discount_pct', true);
 		$partner_commission_rate = (float) $order->get_meta('partner_commission_rate', true);
 		if ( $partner_discount_pct < 0 ) $partner_discount_pct = 0;
 		if ( $partner_commission_rate < 0 ) $partner_commission_rate = 0;
 
-		$partner_base_total = max(0, $subtotal_original - $eb_amount_total);
-		$client_total       = $partner_base_total * (1 - ($partner_discount_pct / 100));
-		$partner_commission = $partner_base_total * ($partner_commission_rate / 100);
-		$client_discount    = max(0.0, $partner_base_total - $client_total);
+		$partner_base_total = $this->money_round( max(0, $subtotal_original - $eb_amount_total) );
+
+		// IMPORTANT: round discount amount first, then derive totals from rounded components.
+		// This matches the GF UI where discount lines are rounded and total is computed as base - discount.
+		$client_discount    = $this->money_round( $partner_base_total * ($partner_discount_pct / 100) );
+		$client_total       = $this->money_round( max(0.0, $partner_base_total - $client_discount) );
+		$partner_commission = $this->money_round( $partner_base_total * ($partner_commission_rate / 100) );
 
 		$order->update_meta_data('subtotal_original', wc_format_decimal($subtotal_original, 2));
 
