@@ -2,13 +2,13 @@
 /**
  * Plugin Name: TC — Booking Flow (GF → Cart → Order) + Early Booking Snapshot
  * Description: Consolidates GF44 → Woo cart/order booking flow and Early Booking Discount snapshot. Supports optional split of participation vs rental and per-event EB scope toggles.
- * Version: 0.2.14
+ * Version: 0.2.15
  * Author: Tossa Cycling (internal)
  */
 
 if ( ! defined('ABSPATH') ) exit;
 
-if ( ! defined('TC_BF_VERSION') ) define('TC_BF_VERSION','0.2.14');
+if ( ! defined('TC_BF_VERSION') ) define('TC_BF_VERSION','0.2.15');
 if ( ! defined('TC_BF_PATH') ) define('TC_BF_PATH', plugin_dir_path(__FILE__));
 if ( ! defined('TC_BF_URL') ) define('TC_BF_URL', plugin_dir_url(__FILE__));
 
