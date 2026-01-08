@@ -441,11 +441,18 @@ private function cart_contains_entry_id( int $entry_id ) : bool {
 		// Build partner map for JS (code => data)
 		$partners = $this->get_partner_map_for_js();
 
+		// Determine initial partner code from context (admin override > logged-in partner > posted code)
+		$ctx = $this->resolve_partner_context( $form_id );
+		$initial_code = ( ! empty($ctx) && ! empty($ctx['active']) && ! empty($ctx['code']) ) ? (string) $ctx['code'] : '';
+
 		// Cache payload for footer output.
-		$this->partner_js_payload[ $form_id ] = $partners;
+		$this->partner_js_payload[ $form_id ] = [
+			'partners'     => $partners,
+			'initial_code' => $initial_code,
+		];
 
 		// Also register an init script so this works even when GF renders via AJAX.
-		$this->gf_register_partner_init_script( $form_id, $partners );
+		$this->gf_register_partner_init_script( $form_id, $partners, $initial_code );
 
 		return $form;
 	}
@@ -635,11 +642,11 @@ private function cart_contains_entry_id( int $entry_id ) : bool {
 	}
 
 	
-	private function gf_register_partner_init_script( int $form_id, array $partners ) : void {
+	private function gf_register_partner_init_script( int $form_id, array $partners, string $initial_code = '' ) : void {
 		if ( $form_id <= 0 ) return;
 		if ( ! class_exists('\GFFormDisplay') ) return;
 
-		$script = $this->build_partner_override_js( $form_id, $partners );
+		$script = $this->build_partner_override_js( $form_id, $partners, $initial_code );
 		if ( $script === '' ) return;
 
 		// Runs reliably for normal and AJAX-rendered forms.
@@ -651,7 +658,7 @@ private function cart_contains_entry_id( int $entry_id ) : bool {
 		);
 	}
 
-	private function build_partner_override_js( int $form_id, array $partners ) : string {
+	private function build_partner_override_js( int $form_id, array $partners, string $initial_code = '' ) : string {
 
 		// Map: { code => {id,email,commission,discount} }
 		$json = wp_json_encode( $partners );
@@ -661,6 +668,7 @@ private function cart_contains_entry_id( int $entry_id ) : bool {
 			. "window.tcBfPartnerMap[{$form_id}] = {$json};\n"
 			. "(function(){\n"
 			. "  var fid = {$form_id};\n"
+			. "  var initialCode = '" . esc_js( $initial_code ) . "';\n"
 			. "  function qs(sel,root){ return (root||document).querySelector(sel); }\n"
 			. "  function parseLocaleFloat(v){\n"
 			. "    if(v===null||typeof v==='undefined') return 0;\n"
@@ -710,8 +718,12 @@ private function cart_contains_entry_id( int $entry_id ) : bool {
 			. "  function applyPartner(){\n"
 			. "    var map = (window.tcBfPartnerMap && window.tcBfPartnerMap[fid]) ? window.tcBfPartnerMap[fid] : {};\n"
 			. "    var sel = qs('#input_'+fid+'_63');\n"
-			. "    if(!sel) return;\n"
-			. "    var code = (sel.value||'').toString().trim();\n"
+			. "    var code = '';\n"
+			. "    if(sel){ code = (sel.value||'').toString().trim(); }\n"
+			. "    if(!code){ var codeEl = qs('#input_'+fid+'_154'); if(codeEl) code = (codeEl.value||'').toString().trim(); }\n"
+			. "    if(!code && initialCode){ code = (initialCode||'').toString().trim(); }\n"
+			. "    // If admin override select exists and is empty, set it for consistency (best effort).\n"
+			. "    if(sel && code && sel.value !== code){ try{ sel.value = code; }catch(e){} }\n"
 			. "    var data = (code && map && map[code]) ? map[code] : null;\n"
 			. "    if(!data){\n"
 			. "      setVal(154,''); setVal(152,''); setVal(161,''); setVal(153,''); setVal(166,'');\n"
@@ -731,10 +743,11 @@ private function cart_contains_entry_id( int $entry_id ) : bool {
 			. "  }\n"
 			. "  function bind(){\n"
 			. "    var sel = qs('#input_'+fid+'_63');\n"
-			. "    if(!sel) return false;\n"
-			. "    if(sel.__tcBfBound) return true;\n"
-			. "    sel.__tcBfBound = true;\n"
-			. "    sel.addEventListener('change', applyPartner);\n"
+			. "    if(sel && !sel.__tcBfBound){\n"
+			. "      sel.__tcBfBound = true;\n"
+			. "      sel.addEventListener('change', applyPartner);\n"
+			. "    }\n"
+			. "    // Always apply once (supports logged-in partner context even if field 63 is hidden/absent).\n"
 			. "    applyPartner();\n"
 			. "    return true;\n"
 			. "  }\n"
@@ -759,11 +772,14 @@ public function gf_output_partner_js() : void {
 		if ( empty( $this->partner_js_payload ) ) return;
 		if ( is_admin() ) return;
 
-		foreach ( $this->partner_js_payload as $form_id => $partners ) {
+		foreach ( $this->partner_js_payload as $form_id => $payload ) {
 			$form_id = (int) $form_id;
 			if ( $form_id <= 0 ) continue;
 
-			$js = $this->build_partner_override_js( $form_id, $partners );
+			$partners = (is_array($payload) && isset($payload['partners']) && is_array($payload['partners'])) ? $payload['partners'] : [];
+			$initial_code = (is_array($payload) && isset($payload['initial_code'])) ? (string) $payload['initial_code'] : '';
+
+			$js = $this->build_partner_override_js( $form_id, $partners, $initial_code );
 			if ( $js === '' ) continue;
 
 			echo "\n<script id=\"tc-bf-partner-override-{$form_id}\">\n";
