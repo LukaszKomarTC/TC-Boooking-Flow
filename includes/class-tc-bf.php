@@ -66,9 +66,6 @@ final class Plugin {
 	// GF partner dropdown JS payload (per request)
 	private $partner_js_payload = [];
 
-	// GF rental price fix JS payload (per request)
-	private $rental_js_payload = [];
-
 	public static function instance() : self {
 		if ( self::$instance === null ) self::$instance = new self();
 		return self::$instance;
@@ -96,7 +93,6 @@ final class Plugin {
 		add_filter('gform_pre_validation',         [ $this, 'gf_partner_prepare_form' ], 10, 1);
 		add_filter('gform_pre_submission_filter',  [ $this, 'gf_partner_prepare_form' ], 10, 1);
 		add_action('wp_footer',                    [ $this, 'gf_output_partner_js' ], 100);
-		add_action('wp_footer',                    [ $this, 'gf_output_rental_price_js' ], 110);
 
 
 		// ---- GF: submission to cart (single source of truth)
@@ -458,11 +454,6 @@ private function cart_contains_entry_id( int $entry_id ) : bool {
 		// Also register an init script so this works even when GF renders via AJAX.
 		$this->gf_register_partner_init_script( $form_id, $partners, $initial_code );
 
-		// Rental price normalization (frontend): keep GF internal price inputs in dot-decimal,
-		// while showing decimal_comma to the user. This prevents the "30,00" => "3000,00" bug
-		// on hide/show (conditional logic) cycles.
-		$this->gf_register_rental_price_fix( $form_id );
-
 		return $form;
 	}
 
@@ -766,6 +757,13 @@ private function cart_contains_entry_id( int $entry_id ) : bool {
 			. "    if(bind()) return;\n"
 			. "    tries++; if(tries<20) setTimeout(loop, 250);\n"
 			. "  })();\n"
+			. "  // Also watch for late DOM injection (popups, AJAX embeds).\n"
+			. "  if(window.MutationObserver){\n"
+			. "    try{\n"
+			. "      var mo = new MutationObserver(function(){ bind(); });\n"
+			. "      mo.observe(document.body, {childList:true, subtree:true});\n"
+			. "    }catch(e){}\n"
+			. "  }\n"
 			. "})();\n";
 	}
 
@@ -790,208 +788,7 @@ public function gf_output_partner_js() : void {
 		}
 	}
 
-	/**
-	 * Output rental price normalization JS for pages where GF is rendered.
-	 * This is a safety net in addition to GFFormDisplay::add_init_script, and also helps on
-	 * themes/builders that inject the form late.
-	 */
-	public function gf_output_rental_price_js() : void {
-		if ( empty( $this->rental_js_payload ) ) return;
-		if ( is_admin() ) return;
-
-		foreach ( $this->rental_js_payload as $form_id => $payload ) {
-			$form_id = (int) $form_id;
-			if ( $form_id <= 0 ) continue;
-			$prices = (is_array($payload) && isset($payload['prices']) && is_array($payload['prices'])) ? $payload['prices'] : [];
-			$js = $this->build_rental_price_fix_js( $form_id, $prices );
-			if ( $js === '' ) continue;
-			echo "\n<script id=\"tc-bf-rental-price-fix-{$form_id}\">\n";
-			echo $js;
-			echo "\n</script>\n";
-		}
-	}
-
-	/**
-	 * Register rental price fix (per form render).
-	 */
-	private function gf_register_rental_price_fix( int $form_id ) : void {
-		if ( $form_id <= 0 ) return;
-		if ( is_admin() ) return;
-		if ( ! is_singular('sc_event') ) return;
-
-		$event_id = (int) get_queried_object_id();
-		if ( $event_id <= 0 ) return;
-
-		// Pull per-event rental prices from meta (single source of truth).
-		$prices = [
-			'road'   => $this->money_to_float( get_post_meta($event_id, 'rental_price_road', true) ),
-			'mtb'    => $this->money_to_float( get_post_meta($event_id, 'rental_price_mtb', true) ),
-			'ebike'  => $this->money_to_float( get_post_meta($event_id, 'rental_price_ebike', true) ),
-			'gravel' => $this->money_to_float( get_post_meta($event_id, 'rental_price_gravel', true) ),
-		];
-
-		// Cache for footer output (safety net).
-		$this->rental_js_payload[ $form_id ] = [
-			'event_id' => $event_id,
-			'prices'   => $prices,
-		];
-
-		// Register init script (works for standard + AJAX GF renders).
-		if ( class_exists('\GFFormDisplay') ) {
-			$script = $this->build_rental_price_fix_js( $form_id, $prices );
-			if ( $script !== '' ) {
-				\GFFormDisplay::add_init_script(
-					$form_id,
-					'tc_bf_rental_price_fix_' . $form_id,
-					\GFFormDisplay::ON_PAGE_RENDER,
-					$script
-				);
-			}
-		}
-	}
-
-	/**
-	 * Build JS that keeps GF product price inputs in dot-decimal (internal GF format)
-	 * while showing decimal_comma to users.
-	 *
-	 * Fixes bug: after toggling rental (field 106) off/on, a price like "30,00" can be re-parsed
-	 * by GF as "3000" (comma stripped) when a field is hidden/shown.
-	 */
-	
-	private function build_rental_price_fix_js( int $form_id, array $prices ) : string {
-		$form_id = (int) $form_id;
-		if ( $form_id <= 0 ) return '';
-
-		// Ensure predictable floats.
-		$p_road   = (float) ($prices['road'] ?? 0);
-		$p_mtb    = (float) ($prices['mtb'] ?? 0);
-		$p_ebike  = (float) ($prices['ebike'] ?? 0);
-		$p_gravel = (float) ($prices['gravel'] ?? 0);
-
-		return "(function(){\n"
-			. "  var fid = {$form_id};\n"
-			. "  var PRICE = {road:" . $this->float_to_str($p_road) . ", mtb:" . $this->float_to_str($p_mtb) . ", ebike:" . $this->float_to_str($p_ebike) . ", gravel:" . $this->float_to_str($p_gravel) . "};\n"
-			. "  var FIELDS = [139,140,141,171];\n"
-			. "  function qs(sel,root){ return (root||document).querySelector(sel); }\n"
-			. "  function qsa(sel,root){ return Array.prototype.slice.call((root||document).querySelectorAll(sel)); }\n"
-			. "  function toNum(v){\n"
-			. "    if(v===null || typeof v==='undefined') return 0;\n"
-			. "    if(typeof v==='number') return isNaN(v)?0:v;\n"
-			. "    var s = String(v).trim();\n"
-			. "    if(!s) return 0;\n"
-			. "    // Support both 30,00 and 30.00\n"
-			. "    s = s.replace(/\\./g,'').replace(',', '.');\n"
-			. "    // If the above over-removed thousands, fall back to simple comma->dot\n"
-			. "    var n = parseFloat(s);\n"
-			. "    if(isNaN(n)) n = parseFloat(String(v).replace(',','.'));\n"
-			. "    return isNaN(n)?0:n;\n"
-			. "  }\n"
-			. "  function toDot2(v){ return toNum(v).toFixed(2); }\n"
-			. "  function toComma2(v){ return toNum(v).toFixed(2).replace('.', ','); }\n"
-			. "  function getSel(){\n"
-			. "    var el = qs('#input_'+fid+'_106');\n"
-			. "    var v = el ? (el.value||'').toString().trim() : '';\n"
-			. "    if(!v) return '';\n"
-			. "    v = v.toUpperCase();\n"
-			. "    if(v==='EMTB') return 'EMTB';\n"
-			. "    if(v==='E-MTB' || v==='E MTB') return 'E-MTB';\n"
-			. "    return v;\n"
-			. "  }\n"
-			. "  function fieldFor(sel){\n"
-			. "    if(sel==='ROAD') return 139;\n"
-			. "    if(sel==='MTB') return 140;\n"
-			. "    if(sel==='GRAVEL') return 171;\n"
-			. "    if(sel==='EMTB' || sel==='E-MTB') return 141;\n"
-			. "    return 0;\n"
-			. "  }\n"
-			. "  function priceFor(sel){\n"
-			. "    if(sel==='ROAD') return PRICE.road||0;\n"
-			. "    if(sel==='MTB') return PRICE.mtb||0;\n"
-			. "    if(sel==='GRAVEL') return PRICE.gravel||0;\n"
-			. "    if(sel==='EMTB' || sel==='E-MTB') return PRICE.ebike||0;\n"
-			. "    return 0;\n"
-			. "  }\n"
-			. "  function dispatchChange(el){ if(!el) return; try{ el.dispatchEvent(new Event('change',{bubbles:true})); }catch(e){} }\n"
-			. "  function ensureDisplay(wrap, amount){\n"
-			. "    if(!wrap) return;\n"
-			. "    var display = wrap.querySelector('.tc-bf-price-display');\n"
-			. "    if(!display){\n"
-			. "      display = document.createElement('div');\n"
-			. "      display.className = 'tc-bf-price-display';\n"
-			. "      display.style.marginTop = '4px';\n"
-			. "      wrap.appendChild(display);\n"
-			. "    }\n"
-			. "    display.textContent = toComma2(amount) + ' €';\n"
-			. "  }\n"
-			. "  function setInternal(fieldId, amount){\n"
-			. "    var wrap = qs('#field_'+fid+'_'+fieldId);\n"
-			. "    var input = document.getElementById('input_'+fid+'_'+fieldId+'_2') || qs('input[name=\"input_'+fieldId+'.2\"]');\n"
-			. "    if(input){\n"
-			. "      input.value = toDot2(amount);\n"
-			. "      dispatchChange(input);\n"
-			. "      // If this is a visible user-defined price input, hide it and show our locale display.\n"
-			. "      if(input.type !== 'hidden'){\n"
-			. "        input.style.display = 'none';\n"
-			. "        ensureDisplay(wrap, amount);\n"
-			. "      }\n"
-			. "    }\n"
-			. "    // Also update any standard GF price label spans if present.\n"
-			. "    if(wrap){\n"
-			. "      var txt = toComma2(amount) + ' €';\n"
-			. "      qsa('.ginput_product_price, .ginput_product_price_label, .ginput_product_price_wrapper .ginput_product_price', wrap).forEach(function(s){\n"
-			. "        if(s && s.tagName !== 'INPUT') s.textContent = txt;\n"
-			. "      });\n"
-			. "    }\n"
-			. "  }\n"
-			. "  function normalizeExisting(fieldId){\n"
-			. "    var input = document.getElementById('input_'+fid+'_'+fieldId+'_2') || qs('input[name=\"input_'+fieldId+'.2\"]');\n"
-			. "    if(!input) return;\n"
-			. "    var raw = (input.value||'').toString();\n"
-			. "    if(raw.indexOf(',') !== -1){\n"
-			. "      var n = toNum(raw);\n"
-			. "      input.value = toDot2(n);\n"
-			. "    }\n"
-			. "  }\n"
-			. "  var _busy = false;\n"
-			. "  function recalc(){\n"
-			. "    if(_busy) return;\n"
-			. "    _busy = true;\n"
-			. "    setTimeout(function(){\n"
-			. "      try{ if(typeof window.gformCalculateTotalPrice === 'function') window.gformCalculateTotalPrice(fid); }catch(e){}\n"
-			. "      _busy = false;\n"
-			. "    }, 0);\n"
-			. "  }\n"
-			. "  function apply(){\n"
-			. "    // Keep internal values dot-decimal to avoid 30,00 -> 3000 conversion on hide/show.\n"
-			. "    FIELDS.forEach(normalizeExisting);\n"
-			. "    var sel = getSel();\n"
-			. "    if(!sel){ return; }\n"
-			. "    var fid2 = fieldFor(sel);\n"
-			. "    if(!fid2) return;\n"
-			. "    var amt = priceFor(sel);\n"
-			. "    setInternal(fid2, amt);\n"
-			. "    recalc();\n"
-			. "  }\n"
-			. "  function bind(){\n"
-			. "    var el = qs('#input_'+fid+'_106');\n"
-			. "    if(el && !el.__tcBfRentalBound){\n"
-			. "      el.__tcBfRentalBound = true;\n"
-			. "      el.addEventListener('change', function(){ apply(); });\n"
-			. "    }\n"
-			. "    apply();\n"
-			. "    return true;\n"
-			. "  }\n"
-			. "  var tries=0;\n"
-			. "  (function loop(){ if(bind()) return; tries++; if(tries<20) setTimeout(loop, 250); })();\n"
-			. "  if(window.jQuery){\n"
-			. "    try{\n"
-			. "      jQuery(document).on('gform_post_render', function(e, id){ if(parseInt(id,10)===fid) apply(); });\n"
-			. "      jQuery(document).on('gform_post_conditional_logic', function(e, id){ if(parseInt(id,10)===fid) apply(); });\n"
-			. "    }catch(e){}\n"
-			. "  }\n"
-			. "})();\n";
-	}
-private function float_to_str( float $v ) : string {
+	private function float_to_str( float $v ) : string {
 		return rtrim(rtrim(number_format($v, 2, '.', ''), '0'), '.');
 	}
 
