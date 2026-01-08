@@ -1812,9 +1812,11 @@ public function gf_output_partner_js() : void {
 
 		$partner_base_total = $this->money_round( (float) $partner_base_total );
 
-		$client_total = $this->money_round( $partner_base_total * (1 - ($partner_discount_pct / 100)) );
+		// IMPORTANT: round discount amount first, then derive totals from rounded components.
+		// This matches the GF UI where discount lines are rounded and total is computed as base - discount.
+		$client_discount    = $this->money_round( $partner_base_total * ($partner_discount_pct / 100) );
+		$client_total       = $this->money_round( max(0.0, $partner_base_total - $client_discount) );
 		$partner_commission = $this->money_round( $partner_base_total * ($partner_commission_rate / 100) );
-		$client_discount = $this->money_round( max(0.0, $partner_base_total - $client_total) );
 
 		$order->update_meta_data('partner_id', (string) $partner_user_id);
 		$order->update_meta_data('partner_code', $partner_code);
@@ -1898,9 +1900,12 @@ public function gf_output_partner_js() : void {
 		if ( $partner_commission_rate < 0 ) $partner_commission_rate = 0;
 
 		$partner_base_total = $this->money_round( max(0, $subtotal_original - $eb_amount_total) );
-		$client_total       = $this->money_round( $partner_base_total * (1 - ($partner_discount_pct / 100)) );
+
+		// IMPORTANT: round discount amount first, then derive totals from rounded components.
+		// This matches the GF UI where discount lines are rounded and total is computed as base - discount.
+		$client_discount    = $this->money_round( $partner_base_total * ($partner_discount_pct / 100) );
+		$client_total       = $this->money_round( max(0.0, $partner_base_total - $client_discount) );
 		$partner_commission = $this->money_round( $partner_base_total * ($partner_commission_rate / 100) );
-		$client_discount    = $this->money_round( max(0.0, $partner_base_total - $client_total) );
 
 		$order->update_meta_data('subtotal_original', wc_format_decimal($subtotal_original, 2));
 
