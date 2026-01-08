@@ -766,13 +766,6 @@ private function cart_contains_entry_id( int $entry_id ) : bool {
 			. "    if(bind()) return;\n"
 			. "    tries++; if(tries<20) setTimeout(loop, 250);\n"
 			. "  })();\n"
-			. "  // Also watch for late DOM injection (popups, AJAX embeds).\n"
-			. "  if(window.MutationObserver){\n"
-			. "    try{\n"
-			. "      var mo = new MutationObserver(function(){ bind(); });\n"
-			. "      mo.observe(document.body, {childList:true, subtree:true});\n"
-			. "    }catch(e){}\n"
-			. "  }\n"
 			. "})();\n";
 	}
 
