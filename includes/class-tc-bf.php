@@ -13,6 +13,10 @@ final class Plugin {
 	const GF_FIELD_EVENT_ID      = 20;
 	const GF_FIELD_EVENT_TITLE   = 1;
 	const GF_FIELD_TOTAL         = 76;
+	// Client-facing totals (newer form variants)
+	// Field 79 should match field 168 and match the cart/order client total (includes EB + partner discount)
+	const GF_FIELD_CLIENT_TOTAL_A = 79;
+	const GF_FIELD_CLIENT_TOTAL_B = 168;
 	const GF_FIELD_START_RAW     = 132;
 	const GF_FIELD_END_RAW       = 134;
 
@@ -821,54 +825,155 @@ public function gf_output_partner_js() : void {
 			return $validation_result;
 		}
 
-		// Authoritative base price comes from event meta.
-		// IMPORTANT: GF field TOTAL (76) represents the client-facing total, which may include rental.
-		$part_price   = $this->money_to_float( get_post_meta($event_id, 'event_price', true) );
-		$client_total = isset($_POST['input_' . self::GF_FIELD_TOTAL]) ? (float) $_POST['input_' . self::GF_FIELD_TOTAL] : 0.0;
+		// =========================================================
+		// Validation (ledger-first, deterministic)
+		// =========================================================
+		// GF calculated money fields are DISPLAY ONLY. We recompute server-side ledger totals from intent inputs,
+		// then compare against the submitted client totals to prevent JS/locale drift and tampering.
+		//
+		// Requirements (current flow):
+		// - Field 79 must match field 168 (both client-facing totals)
+		// - Both must match the PHP ledger client total (cart/order parity), including EB + partner discount
+		//
+		// IMPORTANT: Never parse money with (float) in a decimal-comma locale. Always use money_to_float().
+		$part_price = $this->money_to_float( get_post_meta($event_id, 'event_price', true) );
+		if ( $part_price < 0 ) $part_price = 0.0;
 
-		if ( $part_price > 0 ) {
-
-			// Determine expected rental price (fixed per-event) based on rental type select (106)
-			// or, as a fallback, based on which bike choice field has a value.
-			$rental_raw  = isset($_POST['input_' . self::GF_FIELD_RENTAL_TYPE]) ? trim((string) $_POST['input_' . self::GF_FIELD_RENTAL_TYPE]) : '';
-			$meta_key    = '';
-			if ( $rental_raw !== '' ) {
-				$rt = strtoupper($rental_raw);
-				if ( strpos($rt, 'ROAD') === 0 )        $meta_key = 'rental_price_road';
-				elseif ( strpos($rt, 'MTB') === 0 )     $meta_key = 'rental_price_mtb';
-				elseif ( strpos($rt, 'EMTB') === 0 )    $meta_key = 'rental_price_ebike';
-				elseif ( strpos($rt, 'E-MTB') === 0 )   $meta_key = 'rental_price_ebike';
-				elseif ( strpos($rt, 'E MTB') === 0 )   $meta_key = 'rental_price_ebike';
-				elseif ( strpos($rt, 'GRAVEL') === 0 )  $meta_key = 'rental_price_gravel';
-			}
-
-			// Fallback: detect from selected bike field
-			if ( $meta_key === '' ) {
-				if ( ! empty($_POST['input_' . self::GF_FIELD_BIKE_130]) )      $meta_key = 'rental_price_road';
-				elseif ( ! empty($_POST['input_' . self::GF_FIELD_BIKE_142]) ) $meta_key = 'rental_price_mtb';
-				elseif ( ! empty($_POST['input_' . self::GF_FIELD_BIKE_143]) ) $meta_key = 'rental_price_ebike';
-				elseif ( ! empty($_POST['input_' . self::GF_FIELD_BIKE_169]) ) $meta_key = 'rental_price_gravel';
-			}
-
-			$rental_price = 0.0;
-			if ( $meta_key !== '' ) {
-				$rental_price = $this->money_to_float( get_post_meta($event_id, $meta_key, true) );
-			}
-
-			$expected_total = $part_price + $rental_price;
-
-			if ( $client_total > 0 ) {
-				// Drift/tamper check (2 cents tolerance)
-				if ( abs($client_total - $expected_total) > 0.02 ) {
-					$validation_result['is_valid'] = false;
-					$validation_result['form'] = $this->gf_mark_field_invalid($form, self::GF_FIELD_TOTAL, __('Total: Price mismatch. Please refresh the page and submit again.', 'tc-booking-flow'));
-					return $validation_result;
-				}
-			} else {
-				// Self-heal: set the client total server-side
-				$_POST['input_' . self::GF_FIELD_TOTAL] = wc_format_decimal($expected_total, 2);
-			}
+		// Determine rental price (fixed per-event) based on rental type select (106)
+		// or, as a fallback, based on which bike choice field has a value.
+		$rental_raw = isset($_POST['input_' . self::GF_FIELD_RENTAL_TYPE]) ? trim((string) $_POST['input_' . self::GF_FIELD_RENTAL_TYPE]) : '';
+		$meta_key   = '';
+		if ( $rental_raw !== '' ) {
+			$rt = strtoupper($rental_raw);
+			if ( strpos($rt, 'ROAD') === 0 )        $meta_key = 'rental_price_road';
+			elseif ( strpos($rt, 'MTB') === 0 )     $meta_key = 'rental_price_mtb';
+			elseif ( strpos($rt, 'EMTB') === 0 )    $meta_key = 'rental_price_ebike';
+			elseif ( strpos($rt, 'E-MTB') === 0 )   $meta_key = 'rental_price_ebike';
+			elseif ( strpos($rt, 'E MTB') === 0 )   $meta_key = 'rental_price_ebike';
+			elseif ( strpos($rt, 'GRAVEL') === 0 )  $meta_key = 'rental_price_gravel';
 		}
+
+		// Fallback: detect from selected bike field
+		if ( $meta_key === '' ) {
+			if ( ! empty($_POST['input_' . self::GF_FIELD_BIKE_130]) )      $meta_key = 'rental_price_road';
+			elseif ( ! empty($_POST['input_' . self::GF_FIELD_BIKE_142]) ) $meta_key = 'rental_price_mtb';
+			elseif ( ! empty($_POST['input_' . self::GF_FIELD_BIKE_143]) ) $meta_key = 'rental_price_ebike';
+			elseif ( ! empty($_POST['input_' . self::GF_FIELD_BIKE_169]) ) $meta_key = 'rental_price_gravel';
+		}
+
+		$rental_price = 0.0;
+		if ( $meta_key !== '' ) {
+			$rental_price = $this->money_to_float( get_post_meta($event_id, $meta_key, true) );
+		}
+		if ( $rental_price < 0 ) $rental_price = 0.0;
+
+		// ---- Build ledger totals (same rounding model as order ledger) ----
+		$calc = $this->calculate_for_event($event_id);
+		$cfg  = (is_array($calc) && isset($calc['cfg']) && is_array($calc['cfg'])) ? (array) $calc['cfg'] : [];
+		$eb_step = (is_array($calc) && isset($calc['step']) && is_array($calc['step'])) ? (array) $calc['step'] : [];
+
+		$subtotal_original = $this->money_round( $part_price + $rental_price );
+
+		// EB applies only to enabled scopes (participation/rental) and only when a step is active.
+		$eb_base = 0.0;
+		if ( ! empty($cfg['enabled']) ) {
+			if ( ! empty($cfg['participation_enabled']) ) $eb_base += $part_price;
+			if ( ! empty($cfg['rental_enabled']) )        $eb_base += $rental_price;
+		}
+		$eb_base = $this->money_round( $eb_base );
+
+		$eb_amount = 0.0;
+		$eb_pct_effective = 0.0;
+		if ( $eb_base > 0 && ! empty($cfg['enabled']) && ! empty($eb_step) ) {
+			$comp = $this->compute_eb_amount( (float) $eb_base, (array) $eb_step, (array) ($cfg['global_cap'] ?? []) );
+			$eb_amount = (float) ($comp['amount'] ?? 0.0);
+			$eb_pct_effective = (float) ($comp['effective_pct'] ?? 0.0);
+		}
+		$eb_amount = $this->money_round( min($eb_base, max(0.0, $eb_amount)) );
+
+		// Partner discount (percentage) — resolved deterministically from context.
+		// Ensure hidden partner fields are written into POST (prevents stale/missing context).
+		$this->gf_partner_prepare_post( $form_id );
+		$ctx = $this->resolve_partner_context( $form_id );
+		$partner_discount_pct = (float) (is_array($ctx) ? ($ctx['discount_pct'] ?? 0.0) : 0.0);
+		if ( $partner_discount_pct < 0 ) $partner_discount_pct = 0.0;
+
+		$partner_base_total = $this->money_round( max(0.0, $subtotal_original - $eb_amount) );
+
+		// IMPORTANT: round discount amount first, then derive totals from rounded components.
+		// This matches the GF UI where discount lines are rounded and total is computed as base - discount.
+		$client_discount    = $this->money_round( $partner_base_total * ($partner_discount_pct / 100) );
+		$expected_client_total = $this->money_round( max(0.0, $partner_base_total - $client_discount) );
+
+		// ---- Read posted client totals (display fields) ----
+		$raw_79  = $_POST['input_' . self::GF_FIELD_CLIENT_TOTAL_A] ?? '';
+		$raw_168 = $_POST['input_' . self::GF_FIELD_CLIENT_TOTAL_B] ?? '';
+
+		$posted_79  = $this->money_round( $this->money_to_float( $raw_79 ) );
+		$posted_168 = $this->money_round( $this->money_to_float( $raw_168 ) );
+
+		// Fallback: if those fields are not present in the active form, fall back to legacy TOTAL (76).
+		$legacy_raw = $_POST['input_' . self::GF_FIELD_TOTAL] ?? '';
+		$posted_legacy = $this->money_round( $this->money_to_float( $legacy_raw ) );
+
+		$have_79  = ($raw_79 !== '');
+		$have_168 = ($raw_168 !== '');
+
+		// Choose primary posted value (prefer 79, then 168, then legacy 76).
+		$posted_primary = $have_79 ? $posted_79 : ($have_168 ? $posted_168 : $posted_legacy);
+		$primary_field_id = $have_79 ? self::GF_FIELD_CLIENT_TOTAL_A : ($have_168 ? self::GF_FIELD_CLIENT_TOTAL_B : self::GF_FIELD_TOTAL);
+
+		// ---- Comparisons (tolerance 0.02) ----
+		$tol = 0.02;
+
+		// 1) Internal form consistency (79 vs 168) — hard fail when both exist.
+		if ( $have_79 && $have_168 && abs($posted_79 - $posted_168) > $tol ) {
+			$this->log('gf.validation.total_inconsistent', [
+				'event_id'      => $event_id,
+				'field_79_raw'  => (string) $raw_79,
+				'field_168_raw' => (string) $raw_168,
+				'field_79'      => $posted_79,
+				'field_168'     => $posted_168,
+				'diff'          => $this->money_round( abs($posted_79 - $posted_168) ),
+			], 'warning');
+			$validation_result['is_valid'] = false;
+			$validation_result['form'] = $this->gf_mark_field_invalid($form, self::GF_FIELD_CLIENT_TOTAL_A, __('Total: Values in the form are out of sync. Please wait for totals to update, then submit again.', 'tc-booking-flow'));
+			return $validation_result;
+		}
+
+		// 2) Ledger parity (posted total vs expected ledger client total)
+		if ( $posted_primary > 0 && abs($posted_primary - $expected_client_total) > $tol ) {
+
+			$this->log('gf.validation.total_mismatch', [
+				'event_id'              => $event_id,
+				'part_price'            => $this->money_round($part_price),
+				'rental_price'          => $this->money_round($rental_price),
+				'subtotal_original'     => $subtotal_original,
+				'eb_base'               => $eb_base,
+				'eb_amount'             => $eb_amount,
+				'eb_effective_pct'      => $this->money_round($eb_pct_effective),
+				'partner_discount_pct'  => $this->money_round($partner_discount_pct),
+				'partner_base_total'    => $partner_base_total,
+				'client_discount'       => $client_discount,
+				'expected_client_total' => $expected_client_total,
+				'posted_primary_field'  => $primary_field_id,
+				'posted_primary_raw'    => $have_79 ? (string)$raw_79 : ($have_168 ? (string)$raw_168 : (string)$legacy_raw),
+				'posted_primary'        => $posted_primary,
+				'diff'                  => $this->money_round( abs($posted_primary - $expected_client_total) ),
+				'rental_type_raw'       => (string) $rental_raw,
+				'rental_meta_key'       => (string) $meta_key,
+			], 'warning');
+
+			$validation_result['is_valid'] = false;
+			$validation_result['form'] = $this->gf_mark_field_invalid($form, $primary_field_id, __('Total: Price mismatch. Please refresh the page and submit again.', 'tc-booking-flow'));
+			return $validation_result;
+		}
+
+		// 3) Self-heal: if totals are empty (rare), write expected total into legacy field to avoid downstream zero.
+		if ( $posted_primary <= 0 && $expected_client_total > 0 ) {
+			$_POST['input_' . self::GF_FIELD_TOTAL] = wc_format_decimal($expected_client_total, 2);
+		}
+
 
 
 		// Rental consistency: if any bike choice is present, require product_id + resource_id.
