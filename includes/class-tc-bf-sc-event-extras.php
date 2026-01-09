@@ -321,6 +321,18 @@ final class Sc_Event_Extras {
         $rental_price_ebike= (string) get_post_meta($event_id, 'rental_price_ebike', true);
         $rental_price_gravel = (string) get_post_meta($event_id, 'rental_price_gravel', true);
 
+        $default_rental_class = '';
+        if ( is_array($categories) ) {
+            foreach ( $categories as $c ) {
+                if ( empty($c['slug']) ) continue;
+                $slug = (string) $c['slug'];
+                if ( $slug === 'road' ) { $default_rental_class = 'road'; break; }
+                if ( $slug === 'mtb' )  { $default_rental_class = 'mtb'; }
+                if ( $slug === 'emtb' ) { $default_rental_class = 'ebike'; }
+                if ( $slug === 'gravel' ) { $default_rental_class = 'gravel'; }
+            }
+        }
+
         $is_admin = current_user_can('manage_options') ? 1 : 0;
 
         echo "\n<script id=\"tc-bf-sc-event-inline-js\">\n";
@@ -401,6 +413,7 @@ final class Sc_Event_Extras {
                 // Keep deterministic 2 decimals so GF comparisons are stable.
                 return (Math.round(n * 100) / 100).toFixed(2);
             }
+
 
             // Availability flags used by GF conditional logic (Section 57 shows if ANY of these == 'X')
             // Derived from GF form export (Form 44):
@@ -499,8 +512,7 @@ final class Sc_Event_Extras {
             $(document).on('change', '#gform_'+fid+' input, #gform_'+fid+' select', function(){
                 tcBfScheduleRepair();
             });
-
-            // -------------------------------------------------
+// -------------------------------------------------
             // Price helper fields (used by your Section #75 conditional logic)
             // -------------------------------------------------
             // Your form uses hidden/calculation fields to control visibility of the rental section.
@@ -547,6 +559,59 @@ final class Sc_Event_Extras {
                     $("#"+arr[i].slug).show();
                 }
             } catch(e) {}
+
+            // Check first modality radio (GF44 id=4)
+            $("input:radio[name='input_4']:first").prop('checked', true);
+
+            // Rental select option classing & removal (GF44 id=106)
+            var $sel = $("#input_"+fid+"_106");
+            if ($sel.length) {
+                $sel.find('option').eq(1).addClass('road');
+                $sel.find('option').eq(2).addClass('mtb');
+                $sel.find('option').eq(3).addClass('ebike');
+                $sel.find('option').eq(4).addClass('gravel');
+
+                if (tcBfToFloat(tcBfMetaPrices.road)   <= 0) $sel.find('.road').remove();
+                if (tcBfToFloat(tcBfMetaPrices.mtb)    <= 0) $sel.find('.mtb').remove();
+                if (tcBfToFloat(tcBfMetaPrices.ebike)  <= 0) $sel.find('.ebike').remove();
+                if (tcBfToFloat(tcBfMetaPrices.gravel) <= 0) $sel.find('.gravel').remove();
+
+                // Auto-select rental type and reveal the corresponding bike-choice field
+                var defaultRentalClass = "<?php echo esc_js((string)$default_rental_class); ?>";
+
+                function tcBfUpdateBikeFields() {
+                    // Field IDs (legacy GF44)
+                    var map = {road:130, mtb:142, ebike:143, gravel:169};
+
+                    // Hide all bike-choice fields first
+                    $.each(map, function(cls, fieldId){
+                        var $f = $('#field_'+fid+'_'+fieldId);
+                        if ($f.length) $f.hide();
+                    });
+
+                    // Determine selected option class
+                    var $opt = $sel.find('option:selected');
+                    if (!$opt.length) return;
+
+                    var cls = ($opt.attr('class') || '').split(' ')[0];
+                    if (!cls || !map[cls]) return;
+
+                    var $target = $('#field_'+fid+'_'+map[cls]);
+                    if ($target.length) $target.show();
+                }
+
+                // Default selection if none
+                if (!$sel.val() && defaultRentalClass) {
+                    var $opt = $sel.find('option.'+defaultRentalClass).first();
+                    if ($opt.length) $sel.val($opt.val());
+                }
+                tcBfUpdateBikeFields();
+
+                $sel.on('change', function(){
+                    tcBfUpdateBikeFields();
+                    tcBfScheduleRepair();
+                });
+            }
 
         })(jQuery);
         <?php
@@ -1056,7 +1121,8 @@ JS;
                 [vc_column]
                 [vc_separator css='.vc_custom_1607950580058{margin-top: 30px !important;margin-bottom: 30px !important;}']
                 [vc_column_text]<h3 id='participantes'>" . self::tr("[:en]List of participants[:es]Listado de participantes[:]") . "</h3>[/vc_column_text]
-                [gravityview id='37950' search_field='145' search_value='" . $post_id . "_" . get_post_meta( $post_id, 'sc_event_date_time', true ) . "']
+                [gravityview id='37950' search_field='145' search_value='"
+                . $post_id . "_" . get_post_meta( $post_id, 'sc_event_date_time', true ) . "']
                 [/vc_column]
                 [/vc_row]
             " );
@@ -1065,8 +1131,6 @@ JS;
         }
         // If details are moved to header, remove duplicate details from content.
         $custom_content = self::remove_details_from_content_when_in_header( $custom_content, $post_id );
-
-
 
         return $custom_content;
     }
