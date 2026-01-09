@@ -125,6 +125,57 @@ final class Sc_Event_Extras {
     }
 
     /**
+     * Translate qTranslate-style strings like:
+     *   '[:es]Hola[:en]Hello[:]'.
+     *
+     * Uses qTranslate-X / qTranslate-xt if available, otherwise falls back to:
+     * - current locale (es/en) extraction
+     * - or a safe tag-stripped fallback.
+     */
+    private static function tr( string $text ) : string {
+        $text = (string) $text;
+
+        // Prefer qTranslate-X/xt helper if present.
+        if ( function_exists( 'qtranxf_useCurrentLanguageIfNotFoundUseDefaultLanguage' ) ) {
+            try {
+                return (string) qtranxf_useCurrentLanguageIfNotFoundUseDefaultLanguage( $text );
+            } catch ( \Throwable $e ) {
+                // fall through
+            }
+        }
+
+        // Determine desired language code (es/en).
+        $locale = function_exists('determine_locale') ? (string) determine_locale() : (string) get_locale();
+        $lang   = strtolower( substr( $locale, 0, 2 ) );
+        if ( $lang !== 'es' && $lang !== 'en' ) {
+            // Site is ES-first; use ES as default.
+            $lang = 'es';
+        }
+
+        // Parse qTranslate blocks: [:xx]... (until next [:..] or [:])
+        // Example: [:es]Hola[:en]Hello[:]
+        $pattern = '/\[:([a-z]{2})\](.*?)(?=(\[:[a-z]{2}\])|\[:\]|\z)/si';
+        if ( preg_match_all( $pattern, $text, $m, PREG_SET_ORDER ) ) {
+            $map = [];
+            foreach ( $m as $row ) {
+                $code = strtolower( $row[1] );
+                $map[$code] = $row[2];
+            }
+            if ( isset( $map[$lang] ) && $map[$lang] !== '' ) {
+                return (string) $map[$lang];
+            }
+            // fallback to ES, then EN
+            if ( isset( $map['es'] ) && $map['es'] !== '' ) return (string) $map['es'];
+            if ( isset( $map['en'] ) && $map['en'] !== '' ) return (string) $map['en'];
+        }
+
+        // Final fallback: strip qTranslate markers.
+        $text = preg_replace( '/\[:[a-z]{2}\]/i', '', $text );
+        $text = str_replace( '[:]', '', $text );
+        return trim( (string) $text );
+    }
+
+    /**
      * Hook GF population only on single sc_event pages.
      */
     public static function maybe_hook_gf_population() : void {
@@ -1249,10 +1300,9 @@ JS;
 
             $custom_content .= $participants_content;
         }
+
         // If details are moved to header, remove duplicate details from content.
         $custom_content = self::remove_details_from_content_when_in_header( $custom_content, $post_id );
-
-
 
         return $custom_content;
     }
