@@ -240,36 +240,25 @@ final class Sc_Event_Extras {
             return $form;
         }
 
-        self::log('frontend.sc_event.categories', [
-            'event_id' => $event_id,
-            'slugs'    => array_values(array_map(function($t){ return is_object($t) && isset($t->slug) ? (string)$t->slug : ''; }, (array)$cat_array)),
-        ]);
+        $range = self::get_event_date_range($event_id);
+        $range_start_ts = (int) ($range['range_start_ts'] ?? 0);
+        $range_end_exclusive_ts = (int) ($range['range_end_exclusive_ts'] ?? 0);
 
-        $d = self::get_event_date_range($event_id);
-        if ( empty($d['range_start_ts']) || empty($d['range_end_exclusive_ts']) ) {
-            self::log('frontend.gf_population.no_date_range', [
-                'event_id' => $event_id,
-                'range'    => $d,
-            ], 'warning');
-            return $form;
-        }
+        $dateTimeStart = new \DateTime('@' . $range_start_ts);
+        $dateTimeEnd   = new \DateTime('@' . $range_end_exclusive_ts);
 
-        $dateTimeStart = new \DateTime('@' . (int) $d['range_start_ts']);
-        $dateTimeEnd   = new \DateTime('@' . (int) $d['range_end_exclusive_ts']);
+        // Category->product category mapping (same as snippet)
+        foreach ( $cat_array as $cat_id_obj ) {
 
-        // Build rental image choices per rental_* category
-        foreach ( $cat_array as $cat_term ) {
-            $cat_slug = (string) $cat_term->slug;
+            $cat_slug = (string) $cat_id_obj->slug;
 
-            // Map SC event category -> product category id
-            $category_id = 0;
-            if ( $cat_slug === 'rental_road' ) $category_id = 208;
-            elseif ( $cat_slug === 'rental_mtb' ) $category_id = 207;
-            elseif ( $cat_slug === 'rental_emtb' ) $category_id = 209;
-            elseif ( $cat_slug === 'rental_gravel' ) $category_id = 219;
-            else continue;
+            if ( $cat_slug === 'rental_road' )      { $category_id = 208; }
+            else if ( $cat_slug === 'rental_mtb' )  { $category_id = 207; }
+            else if ( $cat_slug === 'rental_emtb' ) { $category_id = 209; }
+            else if ( $cat_slug === 'rental_gravel' ){ $category_id = 219; }
+            else { continue; }
 
-            $q = new \WP_Query([
+            $the_query = new \WP_Query([
                 'post_type'      => 'product',
                 'posts_per_page' => -1,
                 'post_status'    => 'publish',
@@ -281,146 +270,154 @@ final class Sc_Event_Extras {
                     ],
                     [
                         'taxonomy' => 'product_type',
-                        'terms'    => [ 'booking' ],
+                        'terms'    => ['booking'],
                         'field'    => 'slug',
                     ],
                 ],
             ]);
 
-            if ( ! $q->have_posts() ) {
-                wp_reset_postdata();
-                continue;
-            }
+            if ( $the_query->have_posts() ) {
 
-            $choices = [];
-            while ( $q->have_posts() ) {
-                $q->the_post();
+                $choices = [];
 
-                $prod_id  = (int) get_the_ID();
-                $_product = function_exists('wc_get_product') ? wc_get_product($prod_id) : null;
-                if ( ! $_product || ! method_exists($_product,'has_resources') || ! $_product->has_resources() ) {
-                    continue;
-                }
+                while ( $the_query->have_posts() ) {
 
-                foreach ( (array) $_product->get_resources() as $resource ) {
-                    if ( ! $resource || empty($resource->ID) ) continue;
+                    $the_query->the_post();
 
-                    $start_ts = (int) $dateTimeStart->getTimestamp();
-                    $end_ts   = (int) $dateTimeEnd->getTimestamp();
+                    $_product = wc_get_product(get_the_ID());
+                    $prod_id  = get_the_ID();
 
-                    // 1) Capacity
-                    $available_qty = $resource->has_qty() ? (int) $resource->get_qty() : (int) $_product->get_qty();
-
-                    // 2) Availability rules gate
-                    if ( class_exists('WC_Product_Booking_Rule_Manager') ) {
-                        $rules_ok = \WC_Product_Booking_Rule_Manager::check_range_availability_rules(
-                            $_product,
-                            (int) $resource->ID,
-                            $start_ts,
-                            $end_ts
-                        );
-                        if ( ! $rules_ok ) $available_qty = 0;
+                    if ( ! $_product || ! method_exists($_product,'has_resources') || ! $_product->has_resources() ) {
+                        continue;
                     }
 
-                    // 3) Subtract booked qty (incl in-cart)
-                    if ( $available_qty > 0 && class_exists('WC_Bookings_Controller') ) {
-                        $booking_ids = \WC_Bookings_Controller::get_bookings_in_date_range(
-                            $start_ts,
-                            $end_ts,
-                            (int) $resource->ID,
-                            true
-                        );
+                    foreach ( $_product->get_resources() as $resource ) {
 
-                        $booked_qty_resource = 0;
-                        if ( is_array($booking_ids) ) {
-                            foreach ( $booking_ids as $booking_id ) {
-                                $booking = function_exists('get_wc_booking') ? get_wc_booking($booking_id) : null;
-                                if ( ! $booking ) continue;
+                        $start_ts = (int) $dateTimeStart->getTimestamp();
+                        $end_ts   = (int) $dateTimeEnd->getTimestamp();
 
-                                $qty = 1;
-                                if ( method_exists($booking,'get_persons') ) {
-                                    $persons = (array) $booking->get_persons();
-                                    $sum = 0; foreach ( $persons as $p ) { $sum += (int) $p; }
-                                    if ( $sum > 0 ) $qty = $sum;
-                                }
-                                if ( method_exists($booking,'get_qty') ) {
-                                    $qv = (int) $booking->get_qty();
-                                    if ( $qv > 0 ) $qty = $qv;
-                                }
-                                $booked_qty_resource += max(1, $qty);
+                        // 1) Start from configured capacity (resource qty > product qty fallback)
+                        $available_qty = $resource->has_qty() ? (int) $resource->get_qty() : (int) $_product->get_qty();
+
+                        // 2) HARD GATE: apply Woo Bookings availability rules (global + product + resource)
+                        if ( class_exists( 'WC_Product_Booking_Rule_Manager' ) ) {
+                            $rules_ok = \WC_Product_Booking_Rule_Manager::check_range_availability_rules(
+                                $_product,
+                                (int) $resource->ID,
+                                $start_ts,
+                                $end_ts
+                            );
+                            if ( ! $rules_ok ) {
+                                $available_qty = 0;
                             }
                         }
 
-                        $available_qty = max(0, $available_qty - $booked_qty_resource);
-                    }
+                        // 3) If still potentially available, subtract booked qty (INCLUDING in-cart holds)
+                        if ( $available_qty > 0 && class_exists( 'WC_Bookings_Controller' ) ) {
 
-                    $featured_image = function_exists('wp_get_attachment_url') ? wp_get_attachment_url($_product->get_image_id()) : '';
-                    $size_line = "<br><p style='font-size:x-large;font-weight:bolder;margin-bottom:0'>"
-                        . __( '[:es]Talla:[:en]Size[:]', 'tc-booking-flow' )
-                        . "<span style='display:inline-block;width:6px'></span>"
-                        . esc_html( (string) $resource->get_title() )
-                        . "</p>";
+                            $booking_ids = \WC_Bookings_Controller::get_bookings_in_date_range(
+                                $start_ts,
+                                $end_ts,
+                                (int) $resource->ID,
+                                true // include in-cart bookings
+                            );
 
-                    $left_line = '';
-                    if ( $available_qty > 0 ) {
-                        $left_line = "<p style='margin-top:6px;margin-bottom:0;opacity:.85;font-size:14px;'>"
-                            . (int) $available_qty . ' ' . __( '[:es]disponibles[:en]left[:]', 'tc-booking-flow' )
-                            . "</p>";
-                    }
+                            $booked_qty_resource = 0;
 
-                    // NOT AVAILABLE
-                    if ( $available_qty <= 0 ) {
-                        $choices[] = [
-                            'value' => 'not_avail_' . (int) $resource->ID,
-                            'imageChoices_image' => $featured_image,
-                            'imageChoices_imageID' => $_product->get_image_id(),
-                            'imageChoices_largeImage' => $featured_image,
-                            'text' => get_the_title()
-                                . $size_line
-                                . "<p style='background-color:red;color:white;margin-bottom:-25px;position:relative;top:-150px;z-index:1;transform:rotate(-45deg)'>"
-                                . __( '[:es]NO DISPONIBLE[:en]NOT AVAILABLE[:]', 'tc-booking-flow' )
-                                . "</p>",
-                        ];
-                    } else {
+                            if ( is_array($booking_ids) ) {
+                                foreach ( $booking_ids as $booking_id ) {
+                                    $booking = function_exists('get_wc_booking') ? get_wc_booking($booking_id) : null;
+                                    if ( ! $booking ) continue;
+
+                                    $qty = 1;
+
+                                    if ( method_exists($booking,'get_persons') ) {
+                                        $persons = (array) $booking->get_persons();
+                                        $sum = 0;
+                                        foreach ( $persons as $p ) { $sum += (int) $p; }
+                                        if ( $sum > 0 ) $qty = $sum;
+                                    }
+
+                                    if ( method_exists($booking,'get_qty') ) {
+                                        $q = (int) $booking->get_qty();
+                                        if ( $q > 0 ) $qty = $q;
+                                    }
+
+                                    $booked_qty_resource += max(1, $qty);
+                                }
+                            }
+
+                            $available_qty = max(0, $available_qty - $booked_qty_resource);
+                        }
+
+                        $featured_image = wp_get_attachment_url($_product->get_image_id());
+
+                        $size_line =
+                            "<br><p style='font-size:x-large;font-weight:bolder;margin-bottom:0'>" .
+                            __( '[:es]Talla:[:en]Size[:]', 'tc-booking-flow' ) .
+                            "<span style='display:inline-block;width:6px'></span>" .
+                            esc_html($resource->get_title()) .
+                            "</p>";
+
+                        $left_line = "";
+                        if ( $available_qty > 0 ) {
+                            $left_line = "<p style='margin-top:6px;margin-bottom:0;opacity:.85;font-size:14px;'>"
+                                . (int) $available_qty . " " . __( '[:es]disponibles[:en]left[:]', 'tc-booking-flow' ) .
+                                "</p>";
+                        }
+
+                        // NOT AVAILABLE
+                        if ( $available_qty <= 0 ) {
+
+                            $choice = [];
+                            $choice['value'] = 'not_avail_' . $resource->ID;
+                            $choice['imageChoices_image'] = $featured_image;
+                            $choice['imageChoices_imageID'] = $_product->get_image_id();
+                            $choice['imageChoices_largeImage'] = $featured_image;
+
+                            $choice['text'] =
+                                get_the_title() .
+                                $size_line .
+                                "<p style='background-color:red;color:white;margin-bottom:-25px;position:relative;top:-150px;z-index:1;transform:rotate(-45deg)'>"
+                                . __( '[:es]NO DISPONIBLE[:en]NOT AVAILABLE[:]', 'tc-booking-flow' ) .
+                                "</p>";
+
+                            $choices[] = $choice;
+                        }
+
                         // AVAILABLE
-                        $choices[] = [
-                            'value' => $prod_id . '_' . (int) $resource->ID,
-                            'imageChoices_image' => $featured_image,
-                            'imageChoices_imageID' => $_product->get_image_id(),
-                            'imageChoices_largeImage' => $featured_image,
-                            'text' => get_the_title() . $size_line . $left_line,
-                        ];
+                        if ( $available_qty > 0 ) {
+
+                            $choice = [];
+                            $choice['value'] = $prod_id . '_' . $resource->ID;
+                            $choice['imageChoices_image'] = $featured_image;
+                            $choice['imageChoices_imageID'] = $_product->get_image_id();
+                            $choice['imageChoices_largeImage'] = $featured_image;
+
+                            $choice['text'] =
+                                get_the_title() .
+                                $size_line .
+                                $left_line;
+
+                            $choices[] = $choice;
+                        }
                     }
                 }
-            }
 
-            self::log('frontend.gf_population.choices_built', [
-                'event_id'  => $event_id,
-                'cat_slug'  => $cat_slug,
-                'choices'   => is_array($choices) ? count($choices) : 0,
-            ]);
-
-            // Assign choices to the relevant image choice fields (GF44 legacy field IDs)
-            foreach ( $form['fields'] as &$field ) {
-                if ( function_exists('gf_image_choices') && gf_image_choices() ) {
-                    $has = gf_image_choices()->field_has_image_choices_enabled($field);
-                    if ( ! $has ) continue;
-
-                    if ( $cat_slug === 'rental_road' && (int)$field->id === 130 && strpos((string)$field->cssClass, $cat_slug) !== false ) {
-                        $field->choices = $choices;
-                        self::log('frontend.gf_population.choices_set', ['cat'=>'rental_road','field_id'=>130,'count'=>count($choices)]);
-                    }
-                    if ( $cat_slug === 'rental_mtb' && (int)$field->id === 142 && strpos((string)$field->cssClass, $cat_slug) !== false ) {
-                        $field->choices = $choices;
-                        self::log('frontend.gf_population.choices_set', ['cat'=>'rental_mtb','field_id'=>142,'count'=>count($choices)]);
-                    }
-                    if ( $cat_slug === 'rental_emtb' && (int)$field->id === 143 && strpos((string)$field->cssClass, $cat_slug) !== false ) {
-                        $field->choices = $choices;
-                        self::log('frontend.gf_population.choices_set', ['cat'=>'rental_emtb','field_id'=>143,'count'=>count($choices)]);
-                    }
-                    if ( $cat_slug === 'rental_gravel' && (int)$field->id === 169 && strpos((string)$field->cssClass, $cat_slug) !== false ) {
-                        $field->choices = $choices;
-                        self::log('frontend.gf_population.choices_set', ['cat'=>'rental_gravel','field_id'=>169,'count'=>count($choices)]);
+                foreach ( $form['fields'] as &$field ) {
+                    if ( function_exists('gf_image_choices') && gf_image_choices() ) {
+                        if ( $cat_slug === 'rental_road' && (int) $field->id === 130 && gf_image_choices()->field_has_image_choices_enabled($field) && strpos((string)$field->cssClass, $cat_slug) !== false ) {
+                            $field->choices = $choices;
+                        }
+                        if ( $cat_slug === 'rental_mtb' && (int) $field->id === 142 && gf_image_choices()->field_has_image_choices_enabled($field) && strpos((string)$field->cssClass, $cat_slug) !== false ) {
+                            $field->choices = $choices;
+                        }
+                        if ( $cat_slug === 'rental_emtb' && (int) $field->id === 143 && gf_image_choices()->field_has_image_choices_enabled($field) && strpos((string)$field->cssClass, $cat_slug) !== false ) {
+                            $field->choices = $choices;
+                        }
+                        if ( $cat_slug === 'rental_gravel' && (int) $field->id === 169 && gf_image_choices()->field_has_image_choices_enabled($field) && strpos((string)$field->cssClass, $cat_slug) !== false ) {
+                            $field->choices = $choices;
+                        }
                     }
                 }
             }
@@ -428,119 +425,154 @@ final class Sc_Event_Extras {
             wp_reset_postdata();
         }
 
-        // Populate "in the name of" select
-        foreach ( $form['fields'] as &$field ) {
-            if ( $field->type === 'select' && strpos((string)$field->cssClass, 'inscription_for') !== false ) {
-                $field->choices = $hotel_users_array;
+        // available modalities - related to event categories slugs
+        $modalities = [
+            'btt',
+            'btt_ladies_special',
+            'btt_easy', 'carretera',
+            'carretera_ladies_special',
+            'carretera_easy',
+            'carretera_medium',
+            'ebike',
+            'gravel',
+            'gravel_easy',
+            'participante',
+            'voluntario',
+            'none',
+            'walking',
+        ];
+
+        // count available modalities
+        $cat_number = 0;
+        foreach ( $cat_array as $cat ) {
+            if ( in_array($cat->slug, $modalities, true) ) {
+                $cat_number++;
             }
         }
 
-        // Dynamic population for event/rental prices (using inputNames)
-        add_filter('gform_field_value_event_price', function() use ($event_id){
-            return get_post_meta($event_id, 'event_price', true);
-        });
-        add_filter('gform_field_value_rental_price_road', function() use ($event_id){
-            return get_post_meta($event_id, 'rental_price_road', true);
-        });
-        add_filter('gform_field_value_rental_price_mtb', function() use ($event_id){
-            return get_post_meta($event_id, 'rental_price_mtb', true);
-        });
-        add_filter('gform_field_value_rental_price_ebike', function() use ($event_id){
-            return get_post_meta($event_id, 'rental_price_ebike', true);
-        });
-        add_filter('gform_field_value_rental_price_gravel', function() use ($event_id){
-            return get_post_meta($event_id, 'rental_price_gravel', true);
-        });
+        foreach ( $form['fields'] as &$field ) {
+
+            // populate "in the name of"
+            if ( $field->type === 'select' && strpos((string)$field->cssClass, 'inscription_for') !== false ) {
+                $field->choices = $hotel_users_array;
+            }
+
+            // construct modalities field (GF44 id=4)
+            if ( (int) $field->id === 4 ) {
+                $n = 0;
+                $inputs = [];
+                $choices = [];
+                foreach ( $cat_array as $radio ) {
+                    if ( in_array($radio->slug, $modalities, true) ) {
+                        $n++;
+                        $choices[] = [ 'text' => $radio->name, 'value' => $radio->slug ];
+                        $inputs[]  = [ 'label' => $radio->name, 'id' => $n ];
+                    }
+                }
+                $field->choices = $choices;
+                $field->inputs  = $inputs;
+            }
+
+            // populate the available modalities number field (GF44 id=144)
+            if ( (int) $field->id === 144 ) {
+                $field->defaultValue = $cat_number;
+            }
+        }
+
+        // X for hidden helper fields for event categories in gform
+        $cat_array2 = get_the_terms($event_id, 'sc_event_category');
+        if ( $cat_array2 && ! is_wp_error($cat_array2) ) {
+            foreach ( $cat_array2 as $cat_id_obj ) {
+                $slug = (string) $cat_id_obj->slug;
+                echo "<script>console.log('" . esc_js($slug) . "-X');</script>";
+                ${"fill_field_{$slug}"} = function() { return "X"; };
+                add_filter('gform_field_value_' . $slug, ${"fill_field_{$slug}"} );
+            }
+        }
+
+        // populate price fields from meta
+        $event_price = get_post_meta($event_id, 'event_price', true);
+        if ( isset($event_price) ) {
+            add_filter('gform_field_value_event_price', function() use ($event_id) {
+                return get_post_meta($event_id, 'event_price', true);
+            });
+        }
+
+        $member_price = get_post_meta($event_id, 'member_price', true);
+        if ( isset($member_price) ) {
+            add_filter('gform_field_value_member_price', function() use ($event_id) {
+                return get_post_meta($event_id, 'member_price', true);
+            });
+        }
+
+        foreach ([
+            'rental_price_road'   => 'rental_price_road',
+            'rental_price_mtb'    => 'rental_price_mtb',
+            'rental_price_ebike'  => 'rental_price_ebike',
+            'rental_price_gravel' => 'rental_price_gravel',
+        ] as $input => $meta_key ) {
+            $val = get_post_meta($event_id, $meta_key, true);
+            if ( isset($val) ) {
+                add_filter('gform_field_value_' . $input, function() use ($event_id, $meta_key) {
+                    return get_post_meta($event_id, $meta_key, true);
+                });
+            }
+        }
 
         return $form;
     }
 
     /**
-     * Frontend inline JS for sc_event GF (ported from snippet).
-     * Sets hidden date/event fields, hides unavailable modalities, removes rental options with empty prices,
-     * disables "not_avail" bike radios.
+     * Frontend JS injection (ported from snippet, but consolidated).
+     * NOTE: This handles:
+     * - setting date helper fields (131/132/145/133/134)
+     * - showing modalities tabs
+     * - rental select option removal
+     * - disabling not_avail radio options
      */
     public static function output_sc_event_inline_js() : void {
         if ( ! is_singular('sc_event') ) return;
 
         $event_id = (int) get_queried_object_id();
-        if ( $event_id <= 0 ) $event_id = (int) get_the_ID();
-        if ( $event_id <= 0 || get_post_type($event_id) !== 'sc_event' ) return;
+        if ( $event_id <= 0 ) return;
 
         $form_id = absint( get_option(Settings::OPT_FORM_ID, 44) );
         if ( $form_id <= 0 ) return;
 
-        self::log('frontend.inline_js.print', [
-            'event_id' => $event_id,
-            'form_id'  => $form_id,
-        ]);
-
-        $rental_price_road   = get_post_meta($event_id, 'rental_price_road', true);
-        $rental_price_mtb    = get_post_meta($event_id, 'rental_price_mtb', true);
-        $rental_price_ebike  = get_post_meta($event_id, 'rental_price_ebike', true);
-        $rental_price_gravel = get_post_meta($event_id, 'rental_price_gravel', true);
-
-        // Base participation price (GF field 50 in your current form uses this value for conditional logic / UI).
-        $event_price         = get_post_meta($event_id, 'event_price', true);
-
-        // Determine a sensible default rental type (used to reveal the correct bike field)
-        $default_rental_class = '';
-        $cat_terms = get_the_terms($event_id, 'sc_event_category');
-        $slugs = $cat_terms && ! is_wp_error($cat_terms) ? wp_list_pluck($cat_terms, 'slug') : [];
-        // If the event is a specific rental category, prefer that
-        if ( in_array('rental_road', $slugs, true) )        $default_rental_class = 'road';
-        elseif ( in_array('rental_mtb', $slugs, true) )    $default_rental_class = 'mtb';
-        elseif ( in_array('rental_emtb', $slugs, true) )   $default_rental_class = 'ebike';
-        elseif ( in_array('rental_gravel', $slugs, true) ) $default_rental_class = 'gravel';
-
-        // Otherwise, if exactly one rental price is configured, auto-select it
-        if ( $default_rental_class === '' ) {
-            $avail = [];
-            if ( (string)$rental_price_road   !== '' ) $avail[] = 'road';
-            if ( (string)$rental_price_mtb    !== '' ) $avail[] = 'mtb';
-            if ( (string)$rental_price_ebike  !== '' ) $avail[] = 'ebike';
-            if ( (string)$rental_price_gravel !== '' ) $avail[] = 'gravel';
-            if ( count($avail) === 1 ) $default_rental_class = $avail[0];
-        }
-
-
         $start_ts = (int) get_post_meta($event_id, 'sc_event_date_time', true);
         $end_ts   = (int) get_post_meta($event_id, 'sc_event_end_date_time', true);
-        if ( $start_ts <= 0 ) return;
 
-        $cats = get_the_terms($event_id, 'sc_event_category');
-        $js_array = wp_json_encode( $cats ? array_values($cats) : [] );
+        $start_label = $start_ts ? date_i18n('d-m-Y H:i', $start_ts) : '';
+        $end_label   = $end_ts ? date_i18n('d-m-Y H:i', $end_ts) : '';
 
-        $start_label = gmdate('d-m-Y H:i', $start_ts);
-        $end_label   = $end_ts ? gmdate('d-m-Y H:i', $end_ts) : '';
+        $event_price         = (string) get_post_meta($event_id, 'event_price', true);
+        $rental_price_road   = (string) get_post_meta($event_id, 'rental_price_road', true);
+        $rental_price_mtb    = (string) get_post_meta($event_id, 'rental_price_mtb', true);
+        $rental_price_ebike  = (string) get_post_meta($event_id, 'rental_price_ebike', true);
+        $rental_price_gravel = (string) get_post_meta($event_id, 'rental_price_gravel', true);
 
+        $js_array = wp_json_encode( get_the_terms($event_id, 'sc_event_category') );
+
+        // Default rental class (optional, from settings / meta)
+        $default_rental_class = (string) get_post_meta($event_id, 'tc_default_rental_class', true);
+
+        echo "\n<script id=\"tc-bf-sc-event-inline-js\">\n";
         ?>
-        <script>
         jQuery(function($){
-            try { console.log('[TC_BF] inline_js running', {event_id: <?php echo (int)$event_id; ?>, form_id: <?php echo (int)$form_id; ?>}); } catch(e) {}
             var fid = <?php echo (int) $form_id; ?>;
 
-            // Admin diagnostics: check DOM presence for key rental UI fields
-            if (window.TC_BF_IS_ADMIN) {
+            // Debug helper (admin only)
+            function tcBfDebug(msg, obj){
                 try {
-                    var diag = {
-                        hasForm: ($('#gform_'+fid).length > 0),
-                        hasRentalSelect106: ($('#input_'+fid+'_106').length > 0),
-                        hasRoadField130: ($('#field_'+fid+'_130').length > 0),
-                        hasMtbField142: ($('#field_'+fid+'_142').length > 0),
-                        hasEmtbField143: ($('#field_'+fid+'_143').length > 0),
-                        hasGravelField169: ($('#field_'+fid+'_169').length > 0),
-                        rentalSelectOptions: ($('#input_'+fid+'_106').length ? $('#input_'+fid+'_106 option').length : 0)
-                    };
-                    console.log('[TC_BF] DOM diag', diag);
-                    // Also write into the floating admin diagnostics box if present
-                    var $box = document.getElementById('tc-bf-diag-box');
-                    if ($box) {
-                        var pre = document.getElementById('tc-bf-diag-pre');
-                        if (pre) pre.textContent = JSON.stringify(diag, null, 2);
-                    }
+                    if (window.tcBfIsAdmin) console.log('[TCBF]', msg, obj || '');
                 } catch(e) {}
             }
+
+            // Optional admin flag injected by footer diagnostics
+            window.tcBfIsAdmin = window.tcBfIsAdmin || false;
+
+            // If form isn't present, exit.
+            if (!$('#gform_'+fid).length) return;
 
             // Set hidden date/event fields (GF44 legacy IDs)
             $("#input_"+fid+"_131").val("<?php echo esc_js($start_label); ?>");
@@ -588,24 +620,40 @@ final class Sc_Event_Extras {
                 56: (tcBfToFloat(tcBfMetaPrices.ebike)  > 0) ? 'X' : '',
                 170:(tcBfToFloat(tcBfMetaPrices.gravel) > 0) ? 'X' : ''
             };
-            // Apply GF conditional-logic driver flags and re-run rules.
-            function tcBfApplyDriverFlags(){
-                // Set driver flags (X / empty) that control Section 57 visibility
-                $.each(tcBfAvailFlags, function(fieldId, val){
-                    var $inp = $("#input_"+fid+"_"+fieldId);
-                    if (!$inp.length) return;
-                    $inp.val(val).trigger('change');
-                });
 
-                // Re-run GF conditional logic / pricing calc if available
-                try {
-                    if (typeof window.gf_apply_rules === 'function') {
-                        window.gf_apply_rules(fid, [], true);
-                    }
-                    if (typeof window.gformCalculateTotalPrice === 'function') {
-                        window.gformCalculateTotalPrice(fid);
-                    }
-                } catch(e) {}
+            // Apply GF conditional-logic driver flags (X / empty) and schedule ONE logic+total refresh.
+            // IMPORTANT: These fields are FLAGS ONLY in Form 48 conditional logic. Do not write numeric prices here.
+            var tcBfRecalcTimer = null;
+
+            function tcBfSilentSet($inp, val){
+                if (!$inp || !$inp.length) return;
+                var next = (val === null || typeof val === 'undefined') ? '' : String(val);
+                if ($inp.val() === next) return;
+                $inp.val(next); // no per-field change events (avoid cascading GF recalcs)
+            }
+
+            function tcBfRecalcOnce(){
+                if (tcBfRecalcTimer) window.clearTimeout(tcBfRecalcTimer);
+                tcBfRecalcTimer = window.setTimeout(function(){
+                    try {
+                        if (typeof window.gf_apply_rules === 'function') {
+                            window.gf_apply_rules(fid, [], true);
+                        }
+                        if (typeof window.gformCalculateTotalPrice === 'function') {
+                            window.gformCalculateTotalPrice(fid);
+                        }
+                    } catch(e) {}
+                }, 30);
+            }
+
+            function tcBfApplyDriverFlags(){
+                // Set driver flags (X / empty) that control rental section visibility.
+                tcBfSilentSet($("#input_"+fid+"_55"),  tcBfAvailFlags[55]  || '');
+                tcBfSilentSet($("#input_"+fid+"_50"),  tcBfAvailFlags[50]  || '');
+                tcBfSilentSet($("#input_"+fid+"_56"),  tcBfAvailFlags[56]  || '');
+                tcBfSilentSet($("#input_"+fid+"_170"), tcBfAvailFlags[170] || '');
+
+                tcBfRecalcOnce();
             }
 
             /**
@@ -673,41 +721,6 @@ final class Sc_Event_Extras {
             $(document).on('change', '#gform_'+fid+' input, #gform_'+fid+' select', function(){
                 tcBfScheduleRepair();
             });
-// -------------------------------------------------
-            // Price helper fields (used by your Section #75 conditional logic)
-            // -------------------------------------------------
-            // Your form uses hidden/calculation fields to control visibility of the rental section.
-            // These are set server-side (event meta) and then GF conditional logic evaluates them.
-            // Field IDs per your current GF44:
-            //  - 50  : participation / base event price
-            //  - 55  : road rental price
-            //  - 56  : mtb rental price
-            //  - 170 : eMTB rental price
-            // (We also set gravel if a matching input exists.)
-            var priceFields = {
-                50: "<?php echo esc_js((string)$event_price); ?>",
-                55: "<?php echo esc_js((string)$rental_price_road); ?>",
-                56: "<?php echo esc_js((string)$rental_price_mtb); ?>",
-                170: "<?php echo esc_js((string)$rental_price_ebike); ?>",
-                171: "<?php echo esc_js((string)$rental_price_gravel); ?>" // optional
-            };
-            $.each(priceFields, function(fieldId, val){
-                var $inp = $("#input_"+fid+"_"+fieldId);
-                if (!$inp.length) return;
-                // Do not force empty values; set to 0 to make comparisons deterministic.
-                if (val === null || val === undefined || val === '') val = '0';
-                $inp.val(val).trigger('change');
-            });
-
-            // Ask Gravity Forms to re-evaluate conditional logic after we update helper fields.
-            try {
-                if (typeof window.gf_apply_rules === 'function') {
-                    window.gf_apply_rules(fid, [], true);
-                }
-                if (typeof window.gformCalculateTotalPrice === 'function') {
-                    window.gformCalculateTotalPrice(fid);
-                }
-            } catch(e) {}
 
             // Modalities tab show/hide
             try {
@@ -738,173 +751,93 @@ final class Sc_Event_Extras {
 
                 // Auto-select rental type and reveal the corresponding bike-choice field
                 var defaultRentalClass = "<?php echo esc_js((string)$default_rental_class); ?>";
-
-                function tcBfUpdateBikeFields() {
-                    // Field IDs (legacy GF44)
-                    var map = {road:130, mtb:142, ebike:143, gravel:169};
-
-                    // Hide all bike-choice fields first
-                    $.each(map, function(cls, fieldId){
-                        var $f = $('#field_'+fid+'_'+fieldId);
-                        if ($f.length) $f.hide();
-                    });
-
-                    // Determine selected option class
-                    var $opt = $sel.find('option:selected');
-                    if (!$opt.length) return;
-
-                    var cls = ($opt.attr('class') || '').split(' ')[0];
-                    if (!cls || !map[cls]) return;
-
-                    var $target = $('#field_'+fid+'_'+map[cls]);
-                    if ($target.length) $target.show();
-
-                    // Image-choice fields may have been disabled by GF when the section was hidden.
-                    // Schedule a post-DOM repair after the show/hide finishes.
-                    tcBfScheduleRepair();
-                }
-
-                function tcBfSelectByClass(cls) {
-                    if (!cls) return false;
-                    var $opt = $sel.find('option.'+cls).first();
-                    if (!$opt.length) return false;
-                    $sel.val($opt.val());
-                    // Trigger change so GF conditional logic (if any) also reacts
-                    $sel.trigger('change');
-                    return true;
-                }
-
-                // If nothing selected, choose a sensible default:
-                // - category-driven default (rental_emtb etc.)
-                // - else if only one option remains after removals, select it
-                if (!$sel.val()) {
-                    if (!tcBfSelectByClass(defaultRentalClass)) {
-                        var $realOpts = $sel.find('option').filter(function(){
-                            var v = $(this).val();
-                            return v && v !== '0';
-                        });
-                        if ($realOpts.length === 1) {
-                            $sel.val($realOpts.first().val()).trigger('change');
+                if (defaultRentalClass) {
+                    // Try to pick option that contains the class name
+                    var found = false;
+                    $sel.find('option').each(function(){
+                        var $o = $(this);
+                        if ($o.hasClass(defaultRentalClass)) {
+                            $sel.val($o.val());
+                            found = true;
+                            return false;
                         }
+                    });
+                    if (found) {
+                        $sel.trigger('change');
                     }
                 }
-
-                // Update bike fields now + on change
-                $sel.on('change', tcBfUpdateBikeFields);
-                tcBfUpdateBikeFields();
-
-                // After switching rental type, schedule a repair (Image Choices often re-render)
-                tcBfScheduleRepair();
-
             }
 
-            // Disable not_avail radios
-            $("input:radio").each(function(){
-                var v = String($(this).val()||'');
-                if (v.indexOf('not_avail') >= 0) $(this).prop('disabled', true);
+            // Disable all not_avail options (image choices radios)
+            $("input:radio").each(function() {
+                var v = String($(this).val() || '');
+                if (v.indexOf("not_avail") >= 0) {
+                    $(this).prop("disabled", true);
+                }
             });
 
-            // Final pass on initial load
-            tcBfScheduleRepair();
-
-            // Admin-only quick DOM sanity check
-            if (window.TC_BF_IS_ADMIN) {
-                try {
-                    var dom = {
-                        rental_select: !!$("#input_"+fid+"_106").length,
-                        img_road: !!$("#field_"+fid+"_130").length,
-                        img_mtb: !!$("#field_"+fid+"_142").length,
-                        img_emtb: !!$("#field_"+fid+"_143").length,
-                        img_gravel: !!$("#field_"+fid+"_169").length,
-                        total_field: !!$("#input_"+fid+"_76").length
-                    };
-                    console.log('[TC_BF] GF DOM check', dom);
-                } catch(e) {}
-            }
         });
-        </script>
         <?php
+        echo "\n</script>\n";
     }
 
     /**
-     * Admin-only diagnostic footer to confirm injections and field presence.
+     * Admin-only diagnostics: show key meta + GF field ids on the frontend.
      */
     public static function output_admin_sc_event_diagnostics() : void {
         if ( ! is_singular('sc_event') ) return;
         if ( ! current_user_can('manage_options') ) return;
 
         $event_id = (int) get_queried_object_id();
-        if ( $event_id <= 0 ) $event_id = (int) get_the_ID();
-        if ( $event_id <= 0 || get_post_type($event_id) !== 'sc_event' ) return;
+        if ( $event_id <= 0 ) return;
 
         $form_id = absint( get_option(Settings::OPT_FORM_ID, 44) );
-        $inscription = (string) get_post_meta($event_id, 'inscription', true);
 
-        echo "\n<!-- TC_BF_DIAG event_id={$event_id} form_id={$form_id} inscription={$inscription} -->\n";
-        echo "<script>window.TC_BF_IS_ADMIN=true;</script>";
-        echo '<div id="tc-bf-diag-box" style="position:fixed;bottom:10px;right:10px;z-index:99999;background:#fff;border:2px solid #111;padding:10px;font:12px/1.3 monospace;max-width:420px;box-shadow:0 4px 18px rgba(0,0,0,.2)">';
-        echo '<div style="font-weight:700;margin-bottom:6px">TC Booking Flow – Diagnostics</div>';
-        echo '<div>event_id: <b>'.(int)$event_id.'</b></div>';
-        echo '<div>form_id: <b>'.(int)$form_id.'</b></div>';
-        echo '<div>inscription meta: <b>'.esc_html($inscription ?: '(empty)').'</b></div>';
-        echo '<div style="opacity:.75;margin-top:6px">DOM check:</div>';
-        echo '<pre id="tc-bf-diag-pre" style="white-space:pre-wrap;max-height:220px;overflow:auto;background:#f7f7f7;border:1px solid #ddd;padding:6px;margin:6px 0 0"></pre>';
-        echo '<div style="opacity:.75;margin-top:6px">(Also logged to console)</div>';
-        echo '</div>';
-    }
-
-    /**
-     * qTranslate-X friendly helper (no-op if qTranslate not present).
-     */
-    public static function tr( string $text ) : string {
-        if ( function_exists('qtranxf_useCurrentLanguageIfNotFoundUseDefaultLanguage') ) {
-            return (string) qtranxf_useCurrentLanguageIfNotFoundUseDefaultLanguage($text);
-        }
-        return $text;
-    }
-
-    /**
-     * Ensure sc_event_tag taxonomy exists and is registered for sc_event.
-     * This mirrors your legacy snippet and keeps the "Event Tags" meta box visible.
-     */
-    public static function ensure_event_tag_taxonomy() : void {
-        if ( ! post_type_exists('sc_event') ) return;
-
-        add_post_type_support('sc_event', 'custom-fields');
-
-        $labels = [
-            'name'          => __( 'Event Tags', 'tc-booking-flow' ),
-            'singular_name' => __( 'Event Tag', 'tc-booking-flow' ),
+        $diag = [
+            'event_id' => $event_id,
+            'form_id'  => $form_id,
+            'meta'     => [
+                'event_price'         => (string) get_post_meta($event_id, 'event_price', true),
+                'rental_price_road'   => (string) get_post_meta($event_id, 'rental_price_road', true),
+                'rental_price_mtb'    => (string) get_post_meta($event_id, 'rental_price_mtb', true),
+                'rental_price_ebike'  => (string) get_post_meta($event_id, 'rental_price_ebike', true),
+                'rental_price_gravel' => (string) get_post_meta($event_id, 'rental_price_gravel', true),
+            ],
         ];
 
-        if ( ! taxonomy_exists('sc_event_tag') ) {
-            register_taxonomy(
-                'sc_event_tag',
-                ['sc_event'],
-                [
-                    'labels'            => $labels,
-                    'hierarchical'      => true,
-                    'public'            => true,
-                    'show_ui'           => true,
-                    'show_admin_column' => true,
-                    'show_in_rest'      => true,
-                    'rewrite'           => [ 'slug' => 'sc_event_tags' ],
-                ]
-            );
-        } else {
-            register_taxonomy_for_object_type('sc_event_tag', 'sc_event');
-        }
+        ?>
+        <script>
+            window.tcBfIsAdmin = true;
+            window.tcBfDiag = <?php echo wp_json_encode($diag); ?>;
+        </script>
+        <pre style="display:none" id="tc-bf-diag"><?php echo esc_html( wp_json_encode($diag, JSON_PRETTY_PRINT) ); ?></pre>
+        <?php
+    }
+
+    /**
+     * Ensure sc_event_tag taxonomy exists. Some installations rely on it for tag meta box.
+     */
+    public static function ensure_event_tag_taxonomy() : void {
+        if ( taxonomy_exists('sc_event_tag') ) return;
+
+        register_taxonomy(
+            'sc_event_tag',
+            ['sc_event'],
+            [
+                'label'        => __('Event Tags', 'tc-booking-flow'),
+                'public'       => true,
+                'show_ui'      => true,
+                'show_admin_column' => true,
+                'hierarchical' => false,
+                'rewrite'      => ['slug' => 'sc_event_tag'],
+            ]
+        );
     }
 
     public static function add_metabox() : void {
-        // Avoid duplicate meta boxes if legacy Code Snippets meta box is still active
-        if ( function_exists('se_cal_add_post_meta_box') || function_exists('sc_event_meta') ) {
-            return;
-        }
-
         add_meta_box(
-            'tc-bf-sc-event-meta',
-            'TC — Event meta fields',
+            'tc_bf_sc_event_meta',
+            __('Tossa Cycling — Event Options', 'tc-booking-flow'),
             [__CLASS__, 'render_metabox'],
             'sc_event',
             'normal',
@@ -915,263 +848,242 @@ final class Sc_Event_Extras {
     public static function render_metabox( \WP_Post $post ) : void {
         wp_nonce_field(self::NONCE_KEY, self::NONCE_KEY);
 
-        $get = function(string $key, string $default='') use ($post) : string {
+        $get = function(string $key, $default = '') use ($post) {
             $v = get_post_meta($post->ID, $key, true);
-            return is_scalar($v) ? (string) $v : $default;
+            return $v === '' ? $default : $v;
         };
 
-        $event_price          = $get('event_price');
-        $member_price         = $get('member_price');
-        $rental_price_road    = $get('rental_price_road');
-        $rental_price_mtb     = $get('rental_price_mtb');
-        $rental_price_ebike   = $get('rental_price_ebike');
-        $rental_price_gravel  = $get('rental_price_gravel');
+        $event_price = $get('event_price', '');
+        $member_price = $get('member_price', '');
+        $rental_price_road = $get('rental_price_road', '');
+        $rental_price_mtb = $get('rental_price_mtb', '');
+        $rental_price_ebike = $get('rental_price_ebike', '');
+        $rental_price_gravel = $get('rental_price_gravel', '');
 
-        $inscription          = $get('inscription', 'No'); // Yes/No
-        $participants         = $get('participants', 'No'); // Yes/No
+        $feat_img = $get('feat_img', '');
+        $inscription = $get('inscription', 'No');
+        $participants = $get('participants', 'No');
 
-        $feat_img            = $get('feat_img');
+        $tc_header_title_mode = $get('tc_header_title_mode', 'default');
+        $tc_header_title_custom = $get('tc_header_title_custom', '');
+        $tc_header_subtitle = $get('tc_header_subtitle', '');
+        $tc_header_logo_mode = $get('tc_header_logo_mode', 'none');
+        $tc_header_logo_id = absint( $get('tc_header_logo_id', 0) );
+        $tc_header_logo_url = $get('tc_header_logo_url', '');
+        $tc_header_show_divider = $get('tc_header_show_divider', '1');
+        $tc_header_show_back_link = $get('tc_header_show_back_link', '0');
+        $tc_header_back_link_url = $get('tc_header_back_link_url', '');
+        $tc_header_back_link_label = $get('tc_header_back_link_label', '');
+        $tc_header_details_position = $get('tc_header_details_position', 'content');
+        $tc_header_show_shopkeeper_meta = $get('tc_header_show_shopkeeper_meta', '');
 
-        // Header meta (mirrors legacy snippet #163)
-        $tc_title_mode        = $get('tc_header_title_mode', 'default');
-        $tc_title_custom      = $get('tc_header_title_custom');
-        $tc_subtitle          = $get('tc_header_subtitle');
-        $tc_show_divider      = $get('tc_header_show_divider', '');
+        $tc_header_subtitle_size = absint( $get('tc_header_subtitle_size', 0) );
+        $tc_header_padding_bottom = absint( $get('tc_header_padding_bottom', 0) );
+        $tc_header_details_bottom = absint( $get('tc_header_details_bottom', 0) );
+        $tc_header_logo_margin_bottom = absint( $get('tc_header_logo_margin_bottom', 0) );
+        $tc_header_logo_max_width = absint( $get('tc_header_logo_max_width', 0) );
+        $tc_header_title_max_size = absint( $get('tc_header_title_max_size', 0) );
 
-        $tc_logo_mode         = $get('tc_header_logo_mode', 'none');
-        $tc_logo_id           = absint( $get('tc_header_logo_id', '0') );
-        $tc_logo_url          = $get('tc_header_logo_url');
-
-        $tc_show_back_link    = $get('tc_header_show_back_link', '0');
-        $tc_back_link_url     = $get('tc_header_back_link_url', '/eventos_listado');
-        $tc_back_link_label   = $get('tc_header_back_link_label', '[:en]<< All events[:es]<< Todos los eventos[:]');
-        $tc_details_position  = $get('tc_header_details_position', 'content');
-        $tc_show_shopkeeper_meta = $get('tc_header_show_shopkeeper_meta', '');
-
-        // Per-event sizing controls
-        $tc_subtitle_size         = absint( $get('tc_header_subtitle_size', '0') );
-        $tc_header_padding_bottom = absint( $get('tc_header_padding_bottom', '0') );
-        $tc_details_bottom        = absint( $get('tc_header_details_bottom', '0') );
-        $tc_logo_margin_bottom    = absint( $get('tc_header_logo_margin_bottom', '0') );
-        $tc_logo_max_width        = absint( $get('tc_header_logo_max_width', '0') );
-        $tc_title_max_size        = absint( $get('tc_header_title_max_size', '0') );
+        $logo_preview = '';
+        if ( $tc_header_logo_id ) {
+            $src = wp_get_attachment_image_url($tc_header_logo_id, 'medium');
+            if ( $src ) {
+                $logo_preview = '<img src="'.esc_url($src).'" style="max-width:200px;height:auto" alt="" />';
+            }
+        }
 
         ?>
         <style>
-            .tc-bf-grid{display:grid;grid-template-columns:1fr 1fr;gap:14px 18px;max-width:980px}
-            .tc-bf-grid label{display:block;font-weight:600;margin:0 0 4px}
-            .tc-bf-grid input[type="text"], .tc-bf-grid input[type="number"], .tc-bf-grid select{width:100%}
-            .tc-bf-section{margin:18px 0 0;padding-top:16px;border-top:1px solid #e6e6e6}
-            .tc-bf-h{font-size:13px;font-weight:700;margin:0 0 10px}
-            .tc-bf-help{font-size:12px;opacity:.8;margin-top:4px}
-            .tc-bf-inline{display:flex;gap:10px;align-items:center;flex-wrap:wrap}
-            .tc-bf-logo-preview{display:inline-flex;align-items:center;justify-content:center;width:160px;height:80px;border:1px solid #ddd;background:#fff;overflow:hidden}
-            .tc-bf-logo-preview img{max-width:100%;max-height:100%;display:block}
+            .tc-bf-grid{display:grid;grid-template-columns:1fr 1fr;gap:12px;max-width:900px}
+            .tc-bf-grid .wide{grid-column:1 / -1}
+            .tc-bf-grid label{font-weight:600;display:block;margin-bottom:4px}
+            .tc-bf-grid input[type=text], .tc-bf-grid input[type=number], .tc-bf-grid select{width:100%}
+            .tc-bf-muted{opacity:.8;font-size:12px}
+            .tc-bf-divider{margin:16px 0;border-top:1px solid #ddd}
+            .tc-bf-flex{display:flex;gap:8px;align-items:center}
+            .tc-bf-flex > *{flex:0 0 auto}
         </style>
 
         <div class="tc-bf-grid">
             <div>
-                <label for="event_price">Participation price (event_price)</label>
-                <input id="event_price" name="event_price" type="number" step="0.01" min="0" value="<?php echo esc_attr($event_price); ?>" placeholder="e.g. 20">
+                <label for="event_price"><?php esc_html_e('Event price (base)', 'tc-booking-flow'); ?></label>
+                <input type="text" id="event_price" name="event_price" value="<?php echo esc_attr($event_price); ?>" placeholder="e.g. 20,00" />
+                <div class="tc-bf-muted"><?php esc_html_e('Stored as a number (decimal comma allowed).', 'tc-booking-flow'); ?></div>
+            </div>
+            <div>
+                <label for="member_price"><?php esc_html_e('Member price (optional)', 'tc-booking-flow'); ?></label>
+                <input type="text" id="member_price" name="member_price" value="<?php echo esc_attr($member_price); ?>" placeholder="e.g. 15,00" />
             </div>
 
             <div>
-                <label for="member_price">Member price (member_price)</label>
-                <input id="member_price" name="member_price" type="number" step="0.01" min="0" value="<?php echo esc_attr($member_price); ?>" placeholder="optional">
-                <div class="tc-bf-help">Optional alternate price (legacy field).</div>
+                <label for="rental_price_road"><?php esc_html_e('Rental price — Road', 'tc-booking-flow'); ?></label>
+                <input type="text" id="rental_price_road" name="rental_price_road" value="<?php echo esc_attr($rental_price_road); ?>" placeholder="e.g. 30,00" />
+            </div>
+            <div>
+                <label for="rental_price_mtb"><?php esc_html_e('Rental price — MTB', 'tc-booking-flow'); ?></label>
+                <input type="text" id="rental_price_mtb" name="rental_price_mtb" value="<?php echo esc_attr($rental_price_mtb); ?>" placeholder="e.g. 35,00" />
             </div>
 
             <div>
-                <label>Inscription block</label>
-                <select name="inscription">
-                    <option value="No" <?php selected($inscription, 'No'); ?>>No</option>
-                    <option value="Yes" <?php selected($inscription, 'Yes'); ?>>Yes</option>
+                <label for="rental_price_ebike"><?php esc_html_e('Rental price — eBike', 'tc-booking-flow'); ?></label>
+                <input type="text" id="rental_price_ebike" name="rental_price_ebike" value="<?php echo esc_attr($rental_price_ebike); ?>" placeholder="e.g. 40,00" />
+            </div>
+            <div>
+                <label for="rental_price_gravel"><?php esc_html_e('Rental price — Gravel', 'tc-booking-flow'); ?></label>
+                <input type="text" id="rental_price_gravel" name="rental_price_gravel" value="<?php echo esc_attr($rental_price_gravel); ?>" placeholder="e.g. 30,00" />
+            </div>
+
+            <div class="wide tc-bf-divider"></div>
+
+            <div>
+                <label for="feat_img"><?php esc_html_e('Featured header image', 'tc-booking-flow'); ?></label>
+                <select id="feat_img" name="feat_img">
+                    <option value="" <?php selected($feat_img, ''); ?>><?php esc_html_e('Default (theme setting)', 'tc-booking-flow'); ?></option>
+                    <option value="Yes" <?php selected($feat_img, 'Yes'); ?>><?php esc_html_e('Show', 'tc-booking-flow'); ?></option>
+                    <option value="No" <?php selected($feat_img, 'No'); ?>><?php esc_html_e('Hide', 'tc-booking-flow'); ?></option>
                 </select>
-                <div class="tc-bf-help">If Yes, the Gravity Form will be appended to the event content.</div>
             </div>
 
             <div>
-                <label for="rental_price_road">Rental price ROAD (rental_price_road)</label>
-                <input id="rental_price_road" name="rental_price_road" type="number" step="0.01" min="0" value="<?php echo esc_attr($rental_price_road); ?>" placeholder="e.g. 30">
+                <label><?php esc_html_e('Append to content', 'tc-booking-flow'); ?></label>
+                <div class="tc-bf-flex">
+                    <label style="font-weight:400"><input type="checkbox" name="inscription" value="Yes" <?php checked($inscription, 'Yes'); ?> /> <?php esc_html_e('Inscription form', 'tc-booking-flow'); ?></label>
+                    <label style="font-weight:400"><input type="checkbox" name="participants" value="Yes" <?php checked($participants, 'Yes'); ?> /> <?php esc_html_e('Participants list', 'tc-booking-flow'); ?></label>
+                </div>
+            </div>
+
+            <div class="wide tc-bf-divider"></div>
+
+            <div class="wide">
+                <h4 style="margin:0 0 8px"><?php esc_html_e('Header display', 'tc-booking-flow'); ?></h4>
+                <div class="tc-bf-muted"><?php esc_html_e('Controls your custom single-sc_event header output.', 'tc-booking-flow'); ?></div>
             </div>
 
             <div>
-                <label>Participants list block</label>
-                <select name="participants">
-                    <option value="No" <?php selected($participants, 'No'); ?>>No</option>
-                    <option value="Yes" <?php selected($participants, 'Yes'); ?>>Yes</option>
+                <label for="tc_header_title_mode"><?php esc_html_e('Title mode', 'tc-booking-flow'); ?></label>
+                <select id="tc_header_title_mode" name="tc_header_title_mode">
+                    <option value="default" <?php selected($tc_header_title_mode, 'default'); ?>><?php esc_html_e('Default (event title)', 'tc-booking-flow'); ?></option>
+                    <option value="custom" <?php selected($tc_header_title_mode, 'custom'); ?>><?php esc_html_e('Custom', 'tc-booking-flow'); ?></option>
+                    <option value="hide" <?php selected($tc_header_title_mode, 'hide'); ?>><?php esc_html_e('Hide', 'tc-booking-flow'); ?></option>
                 </select>
-                <div class="tc-bf-help">If Yes, the GravityView list will be appended to the event content.</div>
             </div>
 
             <div>
-                <label for="rental_price_mtb">Rental price MTB (rental_price_mtb)</label>
-                <input id="rental_price_mtb" name="rental_price_mtb" type="number" step="0.01" min="0" value="<?php echo esc_attr($rental_price_mtb); ?>" placeholder="e.g. 30">
+                <label for="tc_header_title_custom"><?php esc_html_e('Custom title', 'tc-booking-flow'); ?></label>
+                <input type="text" id="tc_header_title_custom" name="tc_header_title_custom" value="<?php echo esc_attr($tc_header_title_custom); ?>" placeholder="<?php esc_attr_e('e.g. Gravel Odyssey — Stage 2', 'tc-booking-flow'); ?>" />
             </div>
 
             <div>
-                <label for="rental_price_ebike">Rental price eMTB (rental_price_ebike)</label>
-                <input id="rental_price_ebike" name="rental_price_ebike" type="number" step="0.01" min="0" value="<?php echo esc_attr($rental_price_ebike); ?>" placeholder="e.g. 30">
+                <label for="tc_header_subtitle"><?php esc_html_e('Subtitle', 'tc-booking-flow'); ?></label>
+                <input type="text" id="tc_header_subtitle" name="tc_header_subtitle" value="<?php echo esc_attr($tc_header_subtitle); ?>" placeholder="<?php esc_attr_e('e.g. The REAL Costa Brava', 'tc-booking-flow'); ?>" />
             </div>
 
             <div>
-                <label for="rental_price_gravel">Rental price GRAVEL (rental_price_gravel)</label>
-                <input id="rental_price_gravel" name="rental_price_gravel" type="number" step="0.01" min="0" value="<?php echo esc_attr($rental_price_gravel); ?>" placeholder="e.g. 30">
+                <label for="tc_header_logo_mode"><?php esc_html_e('Logo mode', 'tc-booking-flow'); ?></label>
+                <select id="tc_header_logo_mode" name="tc_header_logo_mode">
+                    <option value="none" <?php selected($tc_header_logo_mode, 'none'); ?>><?php esc_html_e('None', 'tc-booking-flow'); ?></option>
+                    <option value="media" <?php selected($tc_header_logo_mode, 'media'); ?>><?php esc_html_e('Media library', 'tc-booking-flow'); ?></option>
+                    <option value="url" <?php selected($tc_header_logo_mode, 'url'); ?>><?php esc_html_e('Direct URL', 'tc-booking-flow'); ?></option>
+                </select>
+            </div>
+
+            <div class="wide">
+                <label><?php esc_html_e('Logo (media)', 'tc-booking-flow'); ?></label>
+                <div class="tc-bf-flex">
+                    <input type="hidden" id="tc_header_logo_id" name="tc_header_logo_id" value="<?php echo (int) $tc_header_logo_id; ?>" />
+                    <button type="button" class="button" id="tc-bf-logo-pick"><?php esc_html_e('Choose', 'tc-booking-flow'); ?></button>
+                    <button type="button" class="button" id="tc-bf-logo-clear"><?php esc_html_e('Clear', 'tc-booking-flow'); ?></button>
+                </div>
+                <div id="tc-bf-logo-preview" style="margin-top:8px;"><?php echo $logo_preview; ?></div>
+            </div>
+
+            <div class="wide">
+                <label for="tc_header_logo_url"><?php esc_html_e('Logo URL (if mode=url)', 'tc-booking-flow'); ?></label>
+                <input type="text" id="tc_header_logo_url" name="tc_header_logo_url" value="<?php echo esc_attr($tc_header_logo_url); ?>" placeholder="https://..." />
             </div>
 
             <div>
-                <label for="feat_img">Featured image override (feat_img)</label>
-                <input id="feat_img" name="feat_img" type="text" value="<?php echo esc_attr($feat_img); ?>" placeholder="optional">
-                <div class="tc-bf-help">Legacy helper field used by your event template.</div>
-            </div>
-        </div>
-
-        <div class="tc-bf-section">
-            <p class="tc-bf-h">Header / UI (optional) — migrated from snippet #163</p>
-
-            <div class="tc-bf-grid">
-                <div>
-                    <label for="tc_header_title_mode">Title mode</label>
-                    <select id="tc_header_title_mode" name="tc_header_title_mode">
-                        <option value="default" <?php selected($tc_title_mode, 'default'); ?>>Default (post title)</option>
-                        <option value="custom" <?php selected($tc_title_mode, 'custom'); ?>>Custom</option>
-                        <option value="hide" <?php selected($tc_title_mode, 'hide'); ?>>Hide</option>
-                    </select>
-                </div>
-                <div>
-                    <label for="tc_header_title_custom">Custom title (qTranslate supported)</label>
-                    <input id="tc_header_title_custom" name="tc_header_title_custom" type="text" value="<?php echo esc_attr($tc_title_custom); ?>" placeholder="[:en]...[:es]...[:]">
-                </div>
-
-                <div>
-                    <label for="tc_header_subtitle">Subtitle (qTranslate supported)</label>
-                    <input id="tc_header_subtitle" name="tc_header_subtitle" type="text" value="<?php echo esc_attr($tc_subtitle); ?>" placeholder="optional">
-                </div>
-                <div>
-                    <label>
-                        <input type="checkbox" name="tc_header_show_divider" value="1" <?php checked($tc_show_divider, '1'); ?> />
-                        Show divider under title
-                    </label>
-                    <label style="display:block;margin-top:8px">
-                        <input type="checkbox" name="tc_header_show_shopkeeper_meta" value="1" <?php checked($tc_show_shopkeeper_meta, '1'); ?> />
-                        Show Shopkeeper post meta if no subtitle is set
-                    </label>
-                </div>
-
-                <div>
-                    <label for="tc_header_logo_mode">Logo mode</label>
-                    <select id="tc_header_logo_mode" name="tc_header_logo_mode">
-                        <option value="none" <?php selected($tc_logo_mode, 'none'); ?>>No logo</option>
-                        <option value="media" <?php selected($tc_logo_mode, 'media'); ?>>Media library</option>
-                        <option value="url" <?php selected($tc_logo_mode, 'url'); ?>>URL</option>
-                    </select>
-                </div>
-
-                <div>
-                    <label>Logo (media)</label>
-                    <div class="tc-bf-inline">
-                        <span class="tc-bf-logo-preview" id="tc-bf-logo-preview">
-                            <?php
-                            if ( $tc_logo_id ) {
-                                $src = wp_get_attachment_image_url($tc_logo_id, 'medium');
-                                if ( $src ) echo '<img src="'.esc_url($src).'" alt="" />';
-                            }
-                            ?>
-                        </span>
-                        <input type="hidden" id="tc_header_logo_id" name="tc_header_logo_id" value="<?php echo esc_attr((string)$tc_logo_id); ?>">
-                        <button type="button" class="button" id="tc-bf-logo-pick">Select</button>
-                        <button type="button" class="button" id="tc-bf-logo-clear">Clear</button>
-                    </div>
-                    <div class="tc-bf-help">Used when Logo mode = Media library.</div>
-                </div>
-
-                <div>
-                    <label for="tc_header_logo_url">Logo URL</label>
-                    <input id="tc_header_logo_url" name="tc_header_logo_url" type="text" value="<?php echo esc_attr($tc_logo_url); ?>" placeholder="https://...">
-                    <div class="tc-bf-help">Used when Logo mode = URL.</div>
-                </div>
+                <label><?php esc_html_e('Header toggles', 'tc-booking-flow'); ?></label>
+                <label style="font-weight:400;display:block"><input type="checkbox" name="tc_header_show_divider" value="1" <?php checked($tc_header_show_divider, '1'); ?> /> <?php esc_html_e('Show divider under title', 'tc-booking-flow'); ?></label>
+                <label style="font-weight:400;display:block"><input type="checkbox" name="tc_header_show_shopkeeper_meta" value="1" <?php checked($tc_header_show_shopkeeper_meta, '1'); ?> /> <?php esc_html_e('Show Shopkeeper meta line', 'tc-booking-flow'); ?></label>
             </div>
 
-            <p>
-                <label>
-                    <input type="checkbox" name="tc_header_show_back_link" value="1" <?php checked($tc_show_back_link, '1'); ?> />
-                    Show “All events” link in header (top-left)
-                </label>
-            </p>
-            <p>
-                <label for="tc_header_back_link_url">Back link URL</label>
-                <input id="tc_header_back_link_url" name="tc_header_back_link_url" type="text" value="<?php echo esc_attr($tc_back_link_url); ?>" placeholder="/eventos_listado">
-            </p>
-            <p>
-                <label for="tc_header_back_link_label">Back link label (supports qTranslate tags)</label>
-                <input id="tc_header_back_link_label" name="tc_header_back_link_label" type="text"
-                       value="<?php echo esc_attr($tc_back_link_label); ?>"
-                       placeholder="[:en]<< All events[:es]<< Todos los eventos[:]">
-            </p>
-            <p>
-                <label for="tc_header_details_position">Event details block</label>
+            <div>
+                <label><?php esc_html_e('Back link', 'tc-booking-flow'); ?></label>
+                <label style="font-weight:400;display:block"><input type="checkbox" name="tc_header_show_back_link" value="1" <?php checked($tc_header_show_back_link, '1'); ?> /> <?php esc_html_e('Show back link', 'tc-booking-flow'); ?></label>
+                <input type="text" name="tc_header_back_link_url" value="<?php echo esc_attr($tc_header_back_link_url); ?>" placeholder="<?php esc_attr_e('Back URL', 'tc-booking-flow'); ?>" style="margin-top:6px" />
+                <input type="text" name="tc_header_back_link_label" value="<?php echo esc_attr($tc_header_back_link_label); ?>" placeholder="<?php esc_attr_e('Back label', 'tc-booking-flow'); ?>" style="margin-top:6px" />
+            </div>
+
+            <div>
+                <label for="tc_header_details_position"><?php esc_html_e('Event details block position', 'tc-booking-flow'); ?></label>
                 <select id="tc_header_details_position" name="tc_header_details_position">
-                    <option value="content" <?php selected($tc_details_position, 'content'); ?>>Keep inside content</option>
-                    <option value="header" <?php selected($tc_details_position, 'header'); ?>>Move to header bottom</option>
+                    <option value="content" <?php selected($tc_header_details_position, 'content'); ?>><?php esc_html_e('Keep in content (default)', 'tc-booking-flow'); ?></option>
+                    <option value="header" <?php selected($tc_header_details_position, 'header'); ?>><?php esc_html_e('Move to header (with-thumb only)', 'tc-booking-flow'); ?></option>
                 </select>
-            </p>
-
-            <div class="tc-bf-section">
-                <p class="tc-bf-h">Per-event sizing (optional)</p>
-                <div class="tc-bf-grid">
-                    <div>
-                        <label for="tc_header_title_max_size">Title max size (px)</label>
-                        <input id="tc_header_title_max_size" name="tc_header_title_max_size" type="number" min="28" max="140" step="1" value="<?php echo esc_attr((string)$tc_title_max_size); ?>" placeholder="62" />
-                        <div class="tc-bf-help">Desktop cap. Mobile still scales down automatically.</div>
-                    </div>
-                    <div>
-                        <label for="tc_header_subtitle_size">Subtitle max size (px)</label>
-                        <input id="tc_header_subtitle_size" name="tc_header_subtitle_size" type="number" min="10" max="60" step="1" value="<?php echo esc_attr((string)$tc_subtitle_size); ?>" placeholder="20" />
-                        <div class="tc-bf-help">Desktop cap. Mobile still scales down.</div>
-                    </div>
-                    <div>
-                        <label for="tc_header_padding_bottom">Header padding bottom (px)</label>
-                        <input id="tc_header_padding_bottom" name="tc_header_padding_bottom" type="number" min="0" max="200" step="1" value="<?php echo esc_attr((string)$tc_header_padding_bottom); ?>" placeholder="80" />
-                        <div class="tc-bf-help">Reserves space so details bar fits on desktop.</div>
-                    </div>
-                    <div>
-                        <label for="tc_header_details_bottom">Details bottom offset (px)</label>
-                        <input id="tc_header_details_bottom" name="tc_header_details_bottom" type="number" min="0" max="120" step="1" value="<?php echo esc_attr((string)$tc_details_bottom); ?>" placeholder="18" />
-                        <div class="tc-bf-help">Distance from bottom (desktop, when absolute).</div>
-                    </div>
-                    <div>
-                        <label for="tc_header_logo_margin_bottom">Logo margin bottom (px)</label>
-                        <input id="tc_header_logo_margin_bottom" name="tc_header_logo_margin_bottom" type="number" min="0" max="80" step="1" value="<?php echo esc_attr((string)$tc_logo_margin_bottom); ?>" placeholder="10" />
-                        <div class="tc-bf-help">Space under logo before title.</div>
-                    </div>
-                    <div>
-                        <label for="tc_header_logo_max_width">Logo max width (px)</label>
-                        <input id="tc_header_logo_max_width" name="tc_header_logo_max_width" type="number" min="20" max="500" step="1" value="<?php echo esc_attr((string)$tc_logo_max_width); ?>" placeholder="220" />
-                        <div class="tc-bf-help">Desktop cap for header logo (leave empty = default).</div>
-                    </div>
-                </div>
             </div>
+
+            <div class="wide tc-bf-divider"></div>
+
+            <div>
+                <label for="tc_header_logo_max_width"><?php esc_html_e('Logo max width (px)', 'tc-booking-flow'); ?></label>
+                <input type="number" min="0" id="tc_header_logo_max_width" name="tc_header_logo_max_width" value="<?php echo (int) $tc_header_logo_max_width; ?>" />
+            </div>
+
+            <div>
+                <label for="tc_header_title_max_size"><?php esc_html_e('Title max font size (px)', 'tc-booking-flow'); ?></label>
+                <input type="number" min="0" id="tc_header_title_max_size" name="tc_header_title_max_size" value="<?php echo (int) $tc_header_title_max_size; ?>" />
+            </div>
+
+            <div>
+                <label for="tc_header_subtitle_size"><?php esc_html_e('Subtitle font size (px)', 'tc-booking-flow'); ?></label>
+                <input type="number" min="0" id="tc_header_subtitle_size" name="tc_header_subtitle_size" value="<?php echo (int) $tc_header_subtitle_size; ?>" />
+            </div>
+
+            <div>
+                <label for="tc_header_padding_bottom"><?php esc_html_e('Header padding bottom (px)', 'tc-booking-flow'); ?></label>
+                <input type="number" min="0" id="tc_header_padding_bottom" name="tc_header_padding_bottom" value="<?php echo (int) $tc_header_padding_bottom; ?>" />
+            </div>
+
+            <div>
+                <label for="tc_header_details_bottom"><?php esc_html_e('Details bottom offset (px)', 'tc-booking-flow'); ?></label>
+                <input type="number" min="0" id="tc_header_details_bottom" name="tc_header_details_bottom" value="<?php echo (int) $tc_header_details_bottom; ?>" />
+            </div>
+
+            <div>
+                <label for="tc_header_logo_margin_bottom"><?php esc_html_e('Logo margin bottom (px)', 'tc-booking-flow'); ?></label>
+                <input type="number" min="0" id="tc_header_logo_margin_bottom" name="tc_header_logo_margin_bottom" value="<?php echo (int) $tc_header_logo_margin_bottom; ?>" />
+            </div>
+
         </div>
         <?php
     }
 
     public static function save_metabox( int $post_id, \WP_Post $post ) : void {
-        // Avoid double-saving if legacy Code Snippets save handler is active
-        if ( function_exists('ssu_save_post_custom_meta_fields') ) {
+        if ( defined('DOING_AUTOSAVE') && DOING_AUTOSAVE ) return;
+        if ( $post->post_type !== 'sc_event' ) return;
+
+        if ( ! isset($_POST[self::NONCE_KEY]) || ! wp_verify_nonce($_POST[self::NONCE_KEY], self::NONCE_KEY) ) {
             return;
         }
-        if ( defined('DOING_AUTOSAVE') && DOING_AUTOSAVE ) return;
-        if ( ! current_user_can('edit_post', $post_id) ) return;
-
-        if ( ! isset($_POST[self::NONCE_KEY]) || ! wp_verify_nonce($_POST[self::NONCE_KEY], self::NONCE_KEY) ) return;
 
         $save_num = function(string $key) use ($post_id) : void {
             if ( ! isset($_POST[$key]) ) return;
-            $v = trim((string) $_POST[$key]);
-            if ( $v === '' ) { delete_post_meta($post_id, $key); return; }
-            update_post_meta($post_id, $key, wc_format_decimal($v, 2));
+            $raw = trim((string) $_POST[$key]);
+            if ( $raw === '' ) { delete_post_meta($post_id, $key); return; }
+            // Normalize to dot decimal for storage
+            $normalized = str_replace([' ', '€'], '', $raw);
+            // If both comma and dot exist, assume dot is thousands and comma is decimal (e.g. 1.234,56)
+            if ( strpos($normalized, ',') !== false && strpos($normalized, '.') !== false ) {
+                $normalized = str_replace('.', '', $normalized);
+                $normalized = str_replace(',', '.', $normalized);
+            } else {
+                $normalized = str_replace(',', '.', $normalized);
+            }
+            update_post_meta($post_id, $key, (string) floatval($normalized));
         };
 
+        // Numeric price fields
         foreach (['event_price','member_price','rental_price_road','rental_price_mtb','rental_price_ebike','rental_price_gravel'] as $k) {
             $save_num($k);
         }
