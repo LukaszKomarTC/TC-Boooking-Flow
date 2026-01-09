@@ -128,9 +128,6 @@ final class Plugin {
 		// Run late on wp_loaded so WC()->cart is available.
 		add_action('wp_loaded', [ $this, 'maybe_auto_apply_partner_coupon' ], 30);
 
-		// ---- GF currency/locale hardening (decimal comma safety)
-		add_filter('gform_currency',   [ $this, 'gf_force_currency' ], 20, 1);
-		add_filter('gform_currencies', [ $this, 'gf_adjust_currencies' ], 20, 1);
 	}
 
 	/**
@@ -187,52 +184,6 @@ final class Plugin {
 	}
 
 
-
-/**
- * Stage 2 (decimal comma hardening):
- * Force Gravity Forms currency config to a locale-safe decimal comma format so that
- * "30,00" is parsed as 30.00 (not 3000) after conditional-logic re-renders.
- *
- * This is intentionally global because GF re-parses values during AJAX/conditional logic.
- */
-public function gf_force_currency( string $currency ) : string {
-	// Respect explicit currency if it is already EUR.
-	if ( strtoupper($currency) === 'EUR' ) return $currency;
-
-	// If WooCommerce currency is EUR, align GF with it.
-	if ( function_exists('get_woocommerce_currency') ) {
-		$wc_cur = (string) get_woocommerce_currency();
-		if ( strtoupper($wc_cur) === 'EUR' ) return 'EUR';
-	}
-
-	// Default to the existing configured currency.
-	return $currency;
-}
-
-/**
- * Adjust currency separators for EUR to ensure decimal comma parsing is consistent.
- *
- * Gravity Forms reads these separators in JS when it formats/parses product prices and totals.
- */
-public function gf_adjust_currencies( array $currencies ) : array {
-	if ( ! isset($currencies['EUR']) || ! is_array($currencies['EUR']) ) return $currencies;
-
-	// Harden separators for ES style numbers:
-	// 1.234,56  (thousand "."  decimal ",")
-	$currencies['EUR']['decimal_separator']  = ',';
-	$currencies['EUR']['thousand_separator'] = '.';
-
-	// Keep two decimals (safe for payment add-ons).
-	$currencies['EUR']['decimals'] = 2;
-
-	// Match your UI: "30,00 €"
-	$currencies['EUR']['symbol_left'] = '';
-	$currencies['EUR']['symbol_left_space'] = false;
-	$currencies['EUR']['symbol_right'] = '€';
-	$currencies['EUR']['symbol_right_space'] = true;
-
-	return $currencies;
-}
 
 
 	/* =========================================================
