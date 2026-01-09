@@ -125,6 +125,63 @@ final class Sc_Event_Extras {
     }
 
     /**
+     * Normalize price values to dot-decimal format for Gravity Forms.
+     *
+     * GF's internal numeric driver expects dot-decimal (e.g., "30.00"), even when
+     * the display format uses comma-decimal (e.g., "30,00 €" in Spanish locale).
+     *
+     * Without normalization, GF's conditional logic can misparse "30,00" as "3000"
+     * after show/hide events, causing incorrect calculations and display.
+     *
+     * @param mixed $price_value Raw price value from post meta (could be "30,00", "30.00", "30", etc.)
+     * @return string Normalized dot-decimal price string (e.g., "30.00") or "0" for empty values
+     */
+    private static function normalize_price_for_gf( $price_value ) : string {
+        // Handle null/empty values
+        if ( $price_value === null || $price_value === '' ) {
+            return '0';
+        }
+
+        // If already numeric, format it
+        if ( is_numeric($price_value) ) {
+            return number_format((float) $price_value, 2, '.', '');
+        }
+
+        // Parse locale-formatted strings (handles "30,00 €", "30.00", "1.234,56", etc.)
+        $cleaned = trim((string) $price_value);
+        if ( $cleaned === '' ) {
+            return '0';
+        }
+
+        // Remove currency symbols and whitespace
+        $cleaned = preg_replace('/[^0-9,\.\-]/', '', $cleaned);
+
+        // Handle comma as decimal separator (Spanish locale: "30,00")
+        if ( substr_count($cleaned, ',') === 1 && substr_count($cleaned, '.') === 0 ) {
+            $cleaned = str_replace(',', '.', $cleaned);
+        }
+        // Handle European format with both separators (e.g., "1.234,56")
+        elseif ( substr_count($cleaned, ',') === 1 && substr_count($cleaned, '.') >= 1 ) {
+            // If comma appears after dot, it's the decimal separator
+            if ( strrpos($cleaned, ',') > strrpos($cleaned, '.') ) {
+                $cleaned = str_replace('.', '', $cleaned); // Remove thousands separator
+                $cleaned = str_replace(',', '.', $cleaned); // Convert decimal separator
+            } else {
+                // Dot is the decimal separator, comma is thousands
+                $cleaned = str_replace(',', '', $cleaned);
+            }
+        }
+        // Multiple commas = thousands separators
+        elseif ( substr_count($cleaned, ',') > 1 ) {
+            $cleaned = str_replace(',', '', $cleaned);
+        }
+
+        // Parse and format to 2 decimal places
+        $float_val = is_numeric($cleaned) ? (float) $cleaned : 0.0;
+        return number_format($float_val, 2, '.', '');
+    }
+
+    /**
      * Hook GF population only on single sc_event pages.
      */
     public static function maybe_hook_gf_population() : void {
@@ -475,13 +532,16 @@ final class Sc_Event_Extras {
             'form_id'  => $form_id,
         ]);
 
-        $rental_price_road   = get_post_meta($event_id, 'rental_price_road', true);
-        $rental_price_mtb    = get_post_meta($event_id, 'rental_price_mtb', true);
-        $rental_price_ebike  = get_post_meta($event_id, 'rental_price_ebike', true);
-        $rental_price_gravel = get_post_meta($event_id, 'rental_price_gravel', true);
+        // IMPORTANT: Normalize to dot-decimal format (e.g., "30.00") for Gravity Forms parsing.
+        // GF's internal numeric driver expects dot-decimal, even if display shows comma-decimal (30,00 €).
+        // Without this, conditional logic can misparse "30,00" as "3000" after show/hide events.
+        $rental_price_road   = self::normalize_price_for_gf(get_post_meta($event_id, 'rental_price_road', true));
+        $rental_price_mtb    = self::normalize_price_for_gf(get_post_meta($event_id, 'rental_price_mtb', true));
+        $rental_price_ebike  = self::normalize_price_for_gf(get_post_meta($event_id, 'rental_price_ebike', true));
+        $rental_price_gravel = self::normalize_price_for_gf(get_post_meta($event_id, 'rental_price_gravel', true));
 
         // Base participation price (GF field 50 in your current form uses this value for conditional logic / UI).
-        $event_price         = get_post_meta($event_id, 'event_price', true);
+        $event_price         = self::normalize_price_for_gf(get_post_meta($event_id, 'event_price', true));
 
         // Determine a sensible default rental type (used to reveal the correct bike field)
         $default_rental_class = '';
@@ -576,6 +636,56 @@ final class Sc_Event_Extras {
                 return isNaN(n) ? 0 : n;
             }
 
+            /**
+             * Normalize GF price field internal values to dot-decimal format.
+             *
+             * CRITICAL FIX for Spanish locale issue:
+             * When GF runs conditional logic (show/hide), it re-parses field values.
+             * If a field contains "30,00", GF can misinterpret the comma as thousands separator,
+             * treating it as 3000 instead of 30.00.
+             *
+             * This function ensures all price field internal values use dot-decimal format (30.00)
+             * so GF's parser works correctly. The visible display can still show "30,00 €".
+             *
+             * After normalization, we recalculate GF totals to reflect corrected prices.
+             *
+             * Called after: gform_post_conditional_logic
+             */
+            function tcBfNormalizePriceFields(){
+                // Price fields that drive conditional logic and calculations
+                var priceFieldIds = [50, 55, 56, 170, 171]; // participation, road, mtb, ebike, gravel
+
+                var normalized = false;
+                $.each(priceFieldIds, function(idx, fieldId){
+                    var $inp = $("#input_"+fid+"_"+fieldId);
+                    if (!$inp.length) return;
+
+                    var currentVal = $inp.val();
+                    if (currentVal === null || currentVal === undefined || currentVal === '') {
+                        return; // Leave empty values as-is
+                    }
+
+                    // Convert to float and back to dot-decimal string
+                    var floatVal = tcBfToFloat(currentVal);
+                    var normalizedVal = floatVal.toFixed(2); // e.g., "30.00"
+
+                    // Only update if the value actually changed (avoid unnecessary triggers)
+                    if (String(currentVal) !== normalizedVal) {
+                        $inp.val(normalizedVal);
+                        normalized = true;
+                    }
+                });
+
+                // If we normalized any values, recalculate the form totals
+                if (normalized) {
+                    try {
+                        if (typeof window.gformCalculateTotalPrice === 'function') {
+                            window.gformCalculateTotalPrice(fid);
+                        }
+                    } catch(e) {}
+                }
+            }
+
             // Availability flags used by GF conditional logic (Section 57 shows if ANY of these == 'X')
             // Derived from GF form export (Form 44):
             // - 55 = Road rental flag
@@ -663,9 +773,21 @@ final class Sc_Event_Extras {
             });
 
             // After GF conditional logic runs (covers section hide/show toggles)
+            // CRITICAL: This is where GF re-parses field values and the "30,00 → 3000,00" bug occurs.
+            // We ONLY normalize here (not on initial load) to avoid interfering with field 106 visibility.
             $(document).on('gform_post_conditional_logic', function(e, formId){
                 if (parseInt(formId,10) !== fid) return;
                 tcBfScheduleRepair();
+                // Wait a tick to let GF finish its re-parse, then normalize and update bike fields
+                setTimeout(function(){
+                    tcBfNormalizePriceFields();
+                    // After normalization, trigger bike field update if rental select exists
+                    // This ensures the correct bike choice fields show after rental toggle
+                    var $rentalSelect = $("#input_"+fid+"_106");
+                    if ($rentalSelect.length && typeof window.tcBfUpdateBikeFields === 'function') {
+                        window.tcBfUpdateBikeFields();
+                    }
+                }, 10);
             });
 
             // Also schedule repair after any input changes inside the form
@@ -739,7 +861,8 @@ final class Sc_Event_Extras {
                 // Auto-select rental type and reveal the corresponding bike-choice field
                 var defaultRentalClass = "<?php echo esc_js((string)$default_rental_class); ?>";
 
-                function tcBfUpdateBikeFields() {
+                // Expose bike field update function globally so normalization can call it
+                window.tcBfUpdateBikeFields = function() {
                     // Field IDs (legacy GF44)
                     var map = {road:130, mtb:142, ebike:143, gravel:169};
 
@@ -762,7 +885,7 @@ final class Sc_Event_Extras {
                     // Image-choice fields may have been disabled by GF when the section was hidden.
                     // Schedule a post-DOM repair after the show/hide finishes.
                     tcBfScheduleRepair();
-                }
+                };
 
                 function tcBfSelectByClass(cls) {
                     if (!cls) return false;
