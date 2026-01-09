@@ -755,20 +755,20 @@ final class Sc_Event_Extras {
             // Run once now (non-AJAX) and also after GF finishes rendering (AJAX-safe)
             tcBfApplyDriverFlags();
             tcBfScheduleRepair();
-            tcBfNormalizePriceFields(); // Initial normalization
             $(document).on('gform_post_render', function(e, formId){
                 if (parseInt(formId,10) !== fid) return;
                 tcBfApplyDriverFlags();
                 tcBfScheduleRepair();
-                tcBfNormalizePriceFields(); // Normalize after GF renders
             });
 
             // After GF conditional logic runs (covers section hide/show toggles)
-            // CRITICAL: This is where GF re-parses field values, so we must re-normalize here
+            // CRITICAL: This is where GF re-parses field values and the "30,00 → 3000,00" bug occurs.
+            // We ONLY normalize here (not on initial load) to avoid interfering with field 106 visibility.
             $(document).on('gform_post_conditional_logic', function(e, formId){
                 if (parseInt(formId,10) !== fid) return;
                 tcBfScheduleRepair();
-                tcBfNormalizePriceFields(); // Normalize after conditional logic
+                // Wait a tick to let GF finish its re-parse, then normalize
+                setTimeout(function(){ tcBfNormalizePriceFields(); }, 10);
             });
 
             // Also schedule repair after any input changes inside the form
@@ -811,9 +811,6 @@ final class Sc_Event_Extras {
                     window.gformCalculateTotalPrice(fid);
                 }
             } catch(e) {}
-
-            // Normalize price fields after initial population (safety measure)
-            tcBfNormalizePriceFields();
 
             // Modalities tab show/hide
             try {
