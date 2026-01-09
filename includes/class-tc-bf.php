@@ -978,6 +978,14 @@ public function gf_output_partner_js() : void {
 	public function gf_output_rental_price_js() : void {
 
 		$target_form_id = (int) \TC_BF\Admin\Settings::get_form_id();
+
+		// DEBUG: Log conditions
+		$this->log('rental_price_js.check', [
+			'target_form_id' => $target_form_id,
+			'is_singular_sc_event' => is_singular('sc_event'),
+			'event_id' => get_queried_object_id(),
+		]);
+
 		if ( $target_form_id <= 0 ) return;
 		if ( ! is_singular('sc_event') ) return;
 
@@ -998,6 +1006,14 @@ public function gf_output_partner_js() : void {
 			$v = (float) $v;
 			if ( $v > 0 ) { $has_any = true; break; }
 		}
+
+		// DEBUG: Log rental prices found
+		$this->log('rental_price_js.prices', [
+			'event_id' => $event_id,
+			'prices' => $prices,
+			'has_any' => $has_any,
+		]);
+
 		if ( ! $has_any ) return;
 
 		// Normalize to numeric strings (dot-decimal) for parsing.
@@ -1012,6 +1028,12 @@ public function gf_output_partner_js() : void {
 			'formId' => $target_form_id,
 			'prices' => $norm,
 			'fieldIds' => array_keys($norm),
+		]);
+
+		// DEBUG: Confirm JS output
+		$this->log('rental_price_js.output', [
+			'formId' => $target_form_id,
+			'prices' => $norm,
 		]);
 
 		?>
