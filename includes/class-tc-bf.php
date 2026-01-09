@@ -93,6 +93,8 @@ final class Plugin {
 		add_filter('gform_pre_validation',         [ $this, 'gf_partner_prepare_form' ], 10, 1);
 		add_filter('gform_pre_submission_filter',  [ $this, 'gf_partner_prepare_form' ], 10, 1);
 		add_action('wp_footer',                    [ $this, 'gf_output_partner_js' ], 100);
+		// Debug: GF product base price watchdog logger (admin-only, gated)
+		add_action('wp_ajax_tc_bf_gf_debug_log',       [ $this, 'ajax_gf_debug_log' ] );
 
 
 		// ---- GF: submission to cart (single source of truth)
@@ -769,26 +771,250 @@ private function cart_contains_entry_id( int $entry_id ) : bool {
 
 public function gf_output_partner_js() : void {
 
-		if ( empty( $this->partner_js_payload ) ) return;
 		if ( is_admin() ) return;
 
-		foreach ( $this->partner_js_payload as $form_id => $payload ) {
-			$form_id = (int) $form_id;
-			if ( $form_id <= 0 ) continue;
+		$debug_watchdog = $this->should_output_gf_price_watchdog();
 
-			$partners = (is_array($payload) && isset($payload['partners']) && is_array($payload['partners'])) ? $payload['partners'] : [];
-			$initial_code = (is_array($payload) && isset($payload['initial_code'])) ? (string) $payload['initial_code'] : '';
+		// If nothing to output, exit early.
+		if ( ! $debug_watchdog && empty( $this->partner_js_payload ) ) return;
 
-			$js = $this->build_partner_override_js( $form_id, $partners, $initial_code );
-			if ( $js === '' ) continue;
+		// 1) Partner override JS (existing behavior)
+		if ( ! empty( $this->partner_js_payload ) ) {
+			foreach ( $this->partner_js_payload as $form_id => $payload ) {
+				$form_id = (int) $form_id;
+				if ( $form_id <= 0 ) continue;
 
-			echo "\n<script id=\"tc-bf-partner-override-{$form_id}\">\n";
-			echo $js;
-			echo "\n</script>\n";
+				$partners = (is_array($payload) && isset($payload['partners']) && is_array($payload['partners'])) ? $payload['partners'] : [];
+				$initial_code = (is_array($payload) && isset($payload['initial_code'])) ? (string) $payload['initial_code'] : '';
+
+				$js = $this->build_partner_override_js( $form_id, $partners, $initial_code );
+				if ( $js === '' ) continue;
+
+				echo "\n<script id=\"tc-bf-partner-override-{$form_id}\">\n";
+				echo $js;
+				echo "\n</script>\n";
+			}
+		}
+
+		// 2) Debug: product base price watchdog logger
+		if ( $debug_watchdog ) {
+			$js = $this->build_gf_price_watchdog_js();
+			if ( $js !== '' ) {
+				echo "\n<script id=\"tc-bf-gf-price-watchdog\">\n";
+				echo $js;
+				echo "\n</script>\n";
+			}
 		}
 	}
 
-	private function float_to_str( float $v ) : string {
+	private function should_output_gf_price_watchdog() : bool {
+
+		// Admin-only debug logger.
+		if ( is_admin() ) return false;
+		if ( ! is_user_logged_in() ) return false;
+		if ( ! current_user_can('manage_options') ) return false;
+
+		// Gate by URL param OR plugin debug mode.
+		$param = isset($_GET['tc_gf_debug']) ? (string) $_GET['tc_gf_debug'] : '';
+		if ( $param === '1' || $param === 'true' ) return true;
+
+		return $this->is_debug();
+	}
+
+	public function ajax_gf_debug_log() : void {
+
+		// Admin-only endpoint; intentionally not exposed to non-privileged users.
+		if ( ! is_user_logged_in() || ! current_user_can('manage_options') ) {
+			wp_send_json_error(['error' => 'forbidden'], 403);
+		}
+
+		$nonce = isset($_POST['nonce']) ? (string) $_POST['nonce'] : '';
+		if ( ! wp_verify_nonce( $nonce, 'tc_bf_gf_debug_log' ) ) {
+			wp_send_json_error(['error' => 'bad_nonce'], 400);
+		}
+
+		$payload_raw = isset($_POST['payload']) ? wp_unslash($_POST['payload']) : '';
+		$payload = is_string($payload_raw) ? json_decode($payload_raw, true) : null;
+		if ( ! is_array($payload) ) {
+			wp_send_json_error(['error' => 'bad_payload'], 400);
+		}
+
+		// Sanitize + clamp to avoid log bloat.
+		$event = [
+			'ts'        => isset($payload['ts']) ? substr((string) $payload['ts'], 0, 40) : '',
+			'formId'    => isset($payload['formId']) ? (int) $payload['formId'] : 0,
+			'fieldId'   => isset($payload['fieldId']) ? (int) $payload['fieldId'] : 0,
+			'reason'    => isset($payload['reason']) ? substr((string) $payload['reason'], 0, 80) : '',
+			'oldRaw'    => isset($payload['oldRaw']) ? substr((string) $payload['oldRaw'], 0, 80) : '',
+			'newRaw'    => isset($payload['newRaw']) ? substr((string) $payload['newRaw'], 0, 80) : '',
+			'oldNum'    => array_key_exists('oldNum', $payload) ? (float) $payload['oldNum'] : null,
+			'newNum'    => array_key_exists('newNum', $payload) ? (float) $payload['newNum'] : null,
+			'mult'      => array_key_exists('mult', $payload) ? (float) $payload['mult'] : null,
+			'hidden'    => ! empty($payload['hidden']) ? 1 : 0,
+			'rental106' => isset($payload['rental106']) ? substr((string) $payload['rental106'], 0, 40) : '',
+			'stack'     => isset($payload['stack']) ? substr((string) $payload['stack'], 0, 600) : '',
+		];
+
+		$this->log('gf.price_watchdog', $event, 'info');
+
+		wp_send_json_success(['ok' => 1]);
+	}
+
+	private function build_gf_price_watchdog_js() : string {
+
+		$ajax_url = function_exists('admin_url') ? admin_url('admin-ajax.php') : '';
+		$nonce = wp_create_nonce('tc_bf_gf_debug_log');
+
+		// Output is pure JS (no HTML). This is a debug-only watchdog that never mutates values.
+		$js  = "(function(){\n";
+		$js .= "  try {\n";
+		$js .= "    var TC_AJAX='" . esc_js($ajax_url) . "';\n";
+		$js .= "    var TC_NONCE='" . esc_js($nonce) . "';\n";
+		$js .= "    function nowIso(){ try { return new Date().toISOString(); } catch(e){ return ''; } }\n";
+		$js .= "    function q(sel,root){ return (root||document).querySelector(sel); }\n";
+		$js .= "    function qa(sel,root){ return Array.prototype.slice.call((root||document).querySelectorAll(sel)); }\n";
+		$js .= "    function parseMoney(raw){\n";
+		$js .= "      if(raw==null) return null;\n";
+		$js .= "      var s=String(raw);\n";
+		$js .= "      s=s.replace(/\\u00a0/g,' ').trim();\n";
+		$js .= "      // Strip currency and everything except digits, separators and minus\n";
+		$js .= "      s=s.replace(/[^0-9,\\.\\-]/g,'');\n";
+		$js .= "      if(!s) return null;\n";
+		$js .= "      var lastComma=s.lastIndexOf(','), lastDot=s.lastIndexOf('.');\n";
+		$js .= "      var decSep = (lastComma>lastDot) ? ',' : (lastDot>lastComma ? '.' : null);\n";
+		$js .= "      if(decSep){\n";
+		$js .= "        var thouSep = (decSep===',') ? '.' : ',';\n";
+		$js .= "        s=s.split(thouSep).join('');\n";
+		$js .= "        if(decSep===',') s=s.replace(',','.');\n";
+		$js .= "      } else {\n";
+		$js .= "        // Comma-only => decimal comma locale\n";
+		$js .= "        if(s.indexOf(',')!==-1 && s.indexOf('.')===-1) s=s.replace(',','.');\n";
+		$js .= "      }\n";
+		$js .= "      var n=parseFloat(s);\n";
+		$js .= "      return isFinite(n) ? n : null;\n";
+		$js .= "    }\n";
+		$js .= "    function isHidden(el){\n";
+		$js .= "      if(!el) return 0;\n";
+		$js .= "      var gf=el.closest ? el.closest('.gfield') : null;\n";
+		$js .= "      if(!gf) return 0;\n";
+		$js .= "      return (gf.classList.contains('gfield_visibility_hidden') || gf.style.display==='none') ? 1 : 0;\n";
+		$js .= "    }\n";
+		$js .= "    function getRental106(formId){\n";
+		$js .= "      var el=q('#input_'+formId+'_106');\n";
+		$js .= "      return el ? String(el.value||'') : '';\n";
+		$js .= "    }\n";
+		$js .= "    function sendToServer(evt){\n";
+		$js .= "      try {\n";
+		$js .= "        if(!TC_AJAX || !TC_NONCE) return;\n";
+		$js .= "        var fd=new FormData();\n";
+		$js .= "        fd.append('action','tc_bf_gf_debug_log');\n";
+		$js .= "        fd.append('nonce',TC_NONCE);\n";
+		$js .= "        fd.append('payload',JSON.stringify(evt));\n";
+		$js .= "        fetch(TC_AJAX,{method:'POST',credentials:'same-origin',body:fd}).catch(function(){});\n";
+		$js .= "      } catch(e){}\n";
+		$js .= "    }\n";
+		$js .= "    var last={};\n";
+		$js .= "    function logChange(formId, fieldId, reason, oldRaw, newRaw, inputEl){\n";
+		$js .= "      var oldNum=parseMoney(oldRaw);\n";
+		$js .= "      var newNum=parseMoney(newRaw);\n";
+		$js .= "      var mult=null;\n";
+		$js .= "      if(oldNum!=null && newNum!=null && oldNum!==0) mult=(newNum/oldNum);\n";
+		$js .= "      var evt={\n";
+		$js .= "        ts: nowIso(),\n";
+		$js .= "        formId: formId,\n";
+		$js .= "        fieldId: fieldId,\n";
+		$js .= "        reason: reason,\n";
+		$js .= "        oldRaw: String(oldRaw||''),\n";
+		$js .= "        newRaw: String(newRaw||''),\n";
+		$js .= "        oldNum: oldNum,\n";
+		$js .= "        newNum: newNum,\n";
+		$js .= "        mult: mult,\n";
+		$js .= "        hidden: inputEl ? isHidden(inputEl) : 0,\n";
+		$js .= "        rental106: getRental106(formId),\n";
+		$js .= "        stack: (new Error('tc_bf_gf_price_watchdog')).stack || ''\n";
+		$js .= "      };\n";
+		$js .= "      if(window.console && console.warn) console.warn('[TC_BF][GF price watchdog]', evt);\n";
+		$js .= "      // Send only anomalies to server to avoid noise\n";
+		$js .= "      var anomaly=false;\n";
+		$js .= "      if(newNum==null) anomaly=true;\n";
+		$js .= "      if(newNum!=null && newNum>500) anomaly=true;\n";
+		$js .= "      if(mult!=null && ((mult>9.5 && mult<10.5) || (mult>95 && mult<105))) anomaly=true;\n";
+		$js .= "      if(anomaly) sendToServer(evt);\n";
+		$js .= "    }\n";
+		$js .= "    function attachToInput(formId, inp){\n";
+		$js .= "      if(!inp || !inp.id) return;\n";
+		$js .= "      var m=inp.id.match(/^ginput_base_price_([0-9]+)_([0-9]+)$/);\n";
+		$js .= "      if(!m) return;\n";
+		$js .= "      var fid=parseInt(m[2],10)||0;\n";
+		$js .= "      var key=formId+':'+fid;\n";
+		$js .= "      if(last[key] && last[key].el===inp) return;\n";
+		$js .= "      last[key]={el:inp,val:inp.value};\n";
+		$js .= "      var mo=new MutationObserver(function(muts){\n";
+		$js .= "        muts.forEach(function(mu){\n";
+		$js .= "          if(mu.type==='attributes' && mu.attributeName==='value'){\n";
+		$js .= "            var old=last[key].val;\n";
+		$js .= "            var nu=inp.value;\n";
+		$js .= "            if(String(old)!==String(nu)){ last[key].val=nu; logChange(formId,fid,'mutation:value',old,nu,inp); }\n";
+		$js .= "          }\n";
+		$js .= "        });\n";
+		$js .= "      });\n";
+		$js .= "      try { mo.observe(inp,{attributes:true,attributeFilter:['value']}); } catch(e){}\n";
+		$js .= "      inp.addEventListener('change', function(){\n";
+		$js .= "        var old=last[key].val; var nu=inp.value;\n";
+		$js .= "        if(String(old)!==String(nu)){ last[key].val=nu; logChange(formId,fid,'event:change',old,nu,inp); }\n";
+		$js .= "      });\n";
+		$js .= "    }\n";
+		$js .= "    function snapshot(formId, reason){\n";
+		$js .= "      var wrap=q('#gform_wrapper_'+formId);\n";
+		$js .= "      if(!wrap) return;\n";
+		$js .= "      var inputs=qa('input[id^=\"ginput_base_price_'+formId+'_\"]', wrap);\n";
+		$js .= "      inputs.forEach(function(inp){\n";
+		$js .= "        attachToInput(formId, inp);\n";
+		$js .= "        var m=inp.id.match(/^ginput_base_price_[0-9]+_([0-9]+)$/);\n";
+		$js .= "        var fid=m ? (parseInt(m[1],10)||0) : 0;\n";
+		$js .= "        var key=formId+':'+fid;\n";
+		$js .= "        var old=last[key] ? last[key].val : '';\n";
+		$js .= "        var nu=inp.value;\n";
+		$js .= "        if(!last[key]){ last[key]={el:inp,val:nu}; return; }\n";
+		$js .= "        if(String(old)!==String(nu)){ last[key].val=nu; logChange(formId,fid,'snapshot:'+reason,old,nu,inp); }\n";
+		$js .= "      });\n";
+		$js .= "    }\n";
+		$js .= "    function initForm(formId){\n";
+		$js .= "      var wrap=q('#gform_wrapper_'+formId);\n";
+		$js .= "      if(!wrap) return;\n";
+		$js .= "      snapshot(formId,'init');\n";
+		$js .= "      var mo=new MutationObserver(function(muts){\n";
+		$js .= "        var needs=false;\n";
+		$js .= "        muts.forEach(function(mu){ if(mu.addedNodes && mu.addedNodes.length) needs=true; });\n";
+		$js .= "        if(needs) setTimeout(function(){ snapshot(formId,'dom_added'); }, 0);\n";
+		$js .= "      });\n";
+		$js .= "      try { mo.observe(wrap,{childList:true,subtree:true}); } catch(e){}\n";
+		$js .= "    }\n";
+		$js .= "    function initAll(){\n";
+		$js .= "      qa('form[id^=\"gform_\"]').forEach(function(f){\n";
+		$js .= "        var m=f.id.match(/^gform_([0-9]+)$/);\n";
+		$js .= "        if(!m) return;\n";
+		$js .= "        var formId=parseInt(m[1],10)||0;\n";
+		$js .= "        if(formId>0) initForm(formId);\n";
+		$js .= "      });\n";
+		$js .= "    }\n";
+		$js .= "    if(window.gform && gform.addAction){\n";
+		$js .= "      gform.addAction('gform_post_render', function(formId){ initForm(formId); snapshot(formId,'gform_post_render'); });\n";
+		$js .= "      gform.addAction('gform_post_conditional_logic', function(formId){\n";
+		$js .= "        snapshot(formId,'post_conditional_logic');\n";
+		$js .= "        setTimeout(function(){ snapshot(formId,'post_conditional_logic+0'); }, 0);\n";
+		$js .= "        setTimeout(function(){ snapshot(formId,'post_conditional_logic+50'); }, 50);\n";
+		$js .= "        setTimeout(function(){ snapshot(formId,'post_conditional_logic+200'); }, 200);\n";
+		$js .= "      });\n";
+		$js .= "    }\n";
+		$js .= "    if(document.readyState==='loading'){ document.addEventListener('DOMContentLoaded', initAll); } else { initAll(); }\n";
+		$js .= "  } catch(e) { if(window.console&&console.error) console.error('[TC_BF][GF price watchdog] init failed', e); }\n";
+		$js .= "})();\n";
+
+		return $js;
+	}
+
+private function float_to_str( float $v ) : string {
 		return rtrim(rtrim(number_format($v, 2, '.', ''), '0'), '.');
 	}
 
