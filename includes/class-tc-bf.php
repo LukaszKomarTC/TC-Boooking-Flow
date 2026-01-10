@@ -483,8 +483,9 @@ private function cart_contains_entry_id( int $entry_id ) : bool {
 
 		// Write values deterministically.
 		$_POST['input_' . self::GF_FIELD_COUPON_CODE] = (string) ($ctx['code'] ?? '');
-		$_POST['input_152'] = (string) $this->float_to_str( (float) ($ctx['discount_pct'] ?? 0) );
-		$_POST['input_161'] = (string) $this->float_to_str( (float) ($ctx['commission_pct'] ?? 0) );
+		// IMPORTANT: feed percent values as decimal-comma to avoid GF interpreting "7.5" as "75".
+		$_POST['input_152'] = (string) $this->pct_to_gf_str( (float) ($ctx['discount_pct'] ?? 0) );
+		$_POST['input_161'] = (string) $this->pct_to_gf_str( (float) ($ctx['commission_pct'] ?? 0) );
 		$_POST['input_153'] = (string) ($ctx['partner_email'] ?? '');
 		$_POST['input_166'] = (string) ((int) ($ctx['partner_user_id'] ?? 0));
 	}
@@ -802,6 +803,19 @@ public function gf_output_partner_js() : void {
 
 	private function float_to_str( float $v ) : string {
 		return rtrim(rtrim(number_format($v, 2, '.', ''), '0'), '.');
+	}
+
+	/**
+	 * Percent values must be fed into Gravity Forms calculation fields using the site locale.
+	 *
+	 * In a decimal-comma locale, Gravity Forms may interpret a dot as a thousands separator.
+	 * Example: "7.5" can be parsed as "75" which turns a 7.5% partner discount into 75%.
+	 *
+	 * We therefore output percentages as a decimal-comma string ("7,5") for GF fields.
+	 */
+	private function pct_to_gf_str( float $v ) : string {
+		$s = $this->float_to_str( $v );
+		return (strpos($s, '.') !== false) ? str_replace('.', ',', $s) : $s;
 	}
 
 
