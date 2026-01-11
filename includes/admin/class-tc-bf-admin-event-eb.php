@@ -18,9 +18,10 @@ final class Admin_Event_EB {
     const NONCE_FIELD  = '_tc_bf_event_eb_nonce';
 
     public static function init() : void {
-        add_action('add_meta_boxes', [__CLASS__, 'add_meta_box']);
-        add_action('save_post_sc_event', [__CLASS__, 'save_meta'], 10, 2);
-        add_action('admin_notices', [__CLASS__, 'maybe_notice']);
+        // DISABLED (replaced by Admin_Event_Meta in TCBF-11)
+        // add_action('add_meta_boxes', [__CLASS__, 'add_meta_box']);
+        // add_action('save_post_sc_event', [__CLASS__, 'save_meta'], 10, 2);
+        // add_action('admin_notices', [__CLASS__, 'maybe_notice']);
     }
 
     public static function add_meta_box() : void {
