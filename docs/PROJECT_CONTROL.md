@@ -141,7 +141,7 @@ This document serves **two distinct purposes**:
 - Fix:
   - Date format when **Event Details Block** moved to header
 
-> **Current test version:** `v0.1.38`
+> **Current test version:** `v0.2.65`
 
 ---
 
