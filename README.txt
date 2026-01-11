@@ -1,7 +1,7 @@
 TC — Booking Flow (GF → Cart → Order) + Early Booking Snapshot
 
 What this plugin consolidates:
-- GF Form 44 after submission → add booking(s) to Woo cart
+- Gravity for of a settings-driven ID after submission → add booking(s) to Woo cart
 - Early Booking Discount (EB) calculation and GF field population (field 172 inputName early_booking_discount_pct)
 - EB SNAPSHOT stored per cart item and applied from snapshot (no recalculation drift)
 - Partner coupon remains Woo-native (applied by WC()->cart->add_discount), partner commission ledger stored on order
